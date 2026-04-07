@@ -1,5 +1,7 @@
 config.yaml
 sync_state.json
+sync_health.json
+*.tar
 sync.log
 __pycache__/
 *.pyc
