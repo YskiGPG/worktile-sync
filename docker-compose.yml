@@ -1,0 +1,19 @@
+services:
+  worktile-sync:
+    build: .
+    container_name: worktile-sync
+    restart: unless-stopped
+    volumes:
+      # 同步目录 — 映射到 Synology Drive 管理的文件夹
+      - /volume1/SynologyDrive/Worktile:/data/worktile-sync
+      # 配置文件
+      - ./config.yaml:/app/config.yaml:ro
+      # 同步状态持久化
+      - ./sync_state.json:/app/sync_state.json
+    environment:
+      - TZ=Asia/Shanghai
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

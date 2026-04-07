@@ -1,0 +1,13 @@
+config.yaml
+sync_state.json
+sync.log
+__pycache__/
+*.pyc
+.venv/
+.env
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.DS_Store
+Thumbs.db
