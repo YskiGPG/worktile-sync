@@ -56,10 +56,11 @@ class WorktileAPI:
             base_url=self.base_url,
             timeout=httpx.Timeout(timeout, read=300.0),
         )
-        # 上传用单独的 client（跨域，用 x-cookies）
+        # 上传/下载用单独的 client（跨域，用 x-cookies）
         self.box_client = httpx.Client(
             base_url=self.box_url,
             timeout=httpx.Timeout(timeout, read=600.0),
+            limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
         )
 
     def _ts(self) -> str:

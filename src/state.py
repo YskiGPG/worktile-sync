@@ -31,9 +31,11 @@ class SyncState:
     files: dict[str, FileRecord] = field(default_factory=dict)
 
     def save(self, path: Path) -> None:
-        """持久化状态到 JSON 文件"""
+        """持久化状态到 JSON 文件（原子写入：先写临时文件再 rename）"""
         data = {k: asdict(v) for k, v in self.files.items()}
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp_path = path.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp_path.rename(path)
         logger.debug("同步状态已保存到 %s", path)
 
     @classmethod

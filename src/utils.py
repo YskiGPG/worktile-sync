@@ -47,11 +47,23 @@ def safe_name(name: str) -> str:
     return result
 
 
-def setup_logging(level: str = "INFO", log_file: str | None = None) -> None:
-    """配置全局日志"""
+def setup_logging(
+    level: str = "INFO",
+    log_file: str | None = None,
+    max_size_mb: int = 10,
+    backup_count: int = 3,
+) -> None:
+    """配置全局日志（带文件轮转）"""
+    from logging.handlers import RotatingFileHandler
+
     handlers: list[logging.Handler] = [logging.StreamHandler()]
     if log_file:
-        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
+        handlers.append(RotatingFileHandler(
+            log_file,
+            maxBytes=max_size_mb * 1024 * 1024,
+            backupCount=backup_count,
+            encoding="utf-8",
+        ))
 
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),

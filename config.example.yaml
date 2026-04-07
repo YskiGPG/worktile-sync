@@ -1,49 +1,59 @@
 # Worktile 网盘同步配置
 
 worktile:
-  # Worktile 团队主域名
   base_url: "https://zrhubei.worktile.com"
-
-  # 文件存储服务域名（上传用）
   box_url: "https://wt-box.worktile.com"
 
   # Team ID（从 Cookie 键名 s-{team_id} 中获取）
-  team_id: "695364022dd1c542de797196"
+  team_id: "YOUR_TEAM_ID"
 
-  # 认证信息 — 从浏览器 DevTools 中复制完整 Cookie 字符串
   auth:
-    cookie: "s-695364022dd1c542de797196=YOUR_SESSION_TOKEN_HERE"
+    # 从浏览器 DevTools 中复制完整 Cookie 字符串
+    cookie: "s-YOUR_TEAM_ID=YOUR_SESSION_TOKEN"
 
   # 要同步的根文件夹 ID（留空则同步整个团队网盘）
   root_folder_id: ""
 
-# 腾讯云 COS 配置（用于文件下载签名）
-cos:
-  secret_id: "AKIDjKD0b1EDyZx78B8yfIfsu1yhDXkncDds"
-  # SecretKey — 需要从 Worktile 前端 JS 中提取
-  # 运行 python tools/probe_download.py 可自动尝试提取
-  secret_key: ""
-  bucket_host: "app-wt-original-release-1348738073.cos.ap-shanghai.myqcloud.com"
-
 sync:
-  # 本地同步目录
   local_dir: "/data/worktile-sync"
-
-  # 同步间隔（秒）
   interval: 60
 
-  # 是否启用删除同步（远程删除 → 本地也删除）
-  sync_delete: false
+  # 并发下载线程数（首次同步建议 3-5，日常可设 1）
+  max_workers: 3
 
-  # 是否启用 dry-run 模式（只打印不执行）
+  # 是否同步删除操作
+  sync_delete: false
   dry_run: false
 
-  # 忽略的文件/文件夹模式
   ignore_patterns:
     - ".DS_Store"
     - "Thumbs.db"
     - "*.tmp"
 
+# 告警通知（可选，至少启用一种通知方式）
+notification:
+  enabled: false
+  error_threshold: 3  # 连续错误多少轮后发送通知
+
+  # 邮件通知
+  email:
+    enabled: false
+    smtp_host: "smtp.gmail.com"
+    smtp_port: 587
+    username: "yskigpg@gmail.com"
+    password: ""  # Gmail 需要应用专用密码（非登录密码）
+    to: "yskigpg@gmail.com"
+
+  # Webhook 通知（支持 Server酱/PushPlus/企业微信机器人）
+  # Server酱(推送到微信): https://sctapi.ftqq.com/YOUR_SENDKEY.send
+  # PushPlus: https://www.pushplus.plus/send?token=YOUR_TOKEN
+  # 企业微信: https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=YOUR_KEY
+  webhook:
+    enabled: false
+    url: ""
+
 logging:
-  level: "INFO"  # DEBUG / INFO / WARNING / ERROR
+  level: "INFO"
   file: "sync.log"
+  max_size_mb: 10     # 单个日志文件最大 MB
+  backup_count: 3     # 保留历史日志份数
