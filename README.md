@@ -59,26 +59,79 @@ sync:
 **方式一：导入预构建镜像（推荐）**
 
 ```bash
-# 在本地构建并导出
+# 在本地构建并导出（Apple Silicon 需指定 amd64 平台）
 docker buildx build --platform linux/amd64 -t worktile-sync:latest --load .
 docker save worktile-sync:latest -o worktile-sync.tar
 ```
 
-然后在群晖 Docker GUI 中：
-1. **Image → Add → Add From File**，选择 `worktile-sync.tar`
-2. **Launch** 启动容器，配置 Volume 映射：
+将 `worktile-sync.tar` 传输到 NAS（通过 File Station 上传、USB、或网络共享均可）。
 
-| 本地路径 | 容器路径 |
-|---------|---------|
-| `docker/config.yaml` | `/app/config.yaml` |
-| 你的同步目录 | `/data/worktile-sync` |
+#### 群晖 Docker GUI 部署步骤
 
-3. 勾选 **Enable auto-restart**
+**第 1 步：导入镜像**
 
-**方式二：docker-compose**
+Image → Add → **Add From File** → 选择 `worktile-sync.tar`，等待导入完成。
+
+**第 2 步：准备配置文件**
+
+在 NAS 的 `docker` 共享文件夹中放置 `config.yaml`：
+
+```
+/volume1/docker/config.yaml
+```
+
+可通过 File Station 上传，或用 SSH 复制。
+
+**第 3 步：创建容器**
+
+在 Image 列表中选择导入的镜像，点击 **Launch**，按以下步骤配置：
+
+| 页面 | 设置 |
+|------|------|
+| **Network** | 保持默认 `bridge` → Next |
+| **General Settings** | Container Name: `worktile-sync`<br>勾选 **Enable auto-restart** → Next |
+| **Port Settings** | 不需要端口映射，直接 Next |
+| **Volume Settings** | 添加以下两个映射（见下表）→ Next |
+| **Summary** | 确认无误 → Apply |
+
+Volume 映射配置（**最关键**）：
+
+| 操作 | NAS 路径 | 容器路径（Mount Path） |
+|------|---------|----------------------|
+| Add File | `docker/config.yaml` | `/app/config.yaml` |
+| Add Folder | 你的同步目录（如 `worktile同步文件`） | `/data/worktile-sync` |
+
+> **注意**: Volume Settings 页面有两个按钮：**Add File**（映射单个文件）和 **Add Folder**（映射文件夹）。config.yaml 用 Add File，同步目录用 Add Folder。
+
+**第 4 步：验证运行**
+
+容器启动后，在 Container 列表中点击容器名 → **Terminal** 标签页可看到实时日志。正常运行会显示：
+
+```
+[INFO] src.sync - 开始同步...
+[INFO] src.api - 已下载: 文件名.pdf (12345 bytes)
+...
+[INFO] src.sync - 同步完成 — 下载:10 上传:0 删除(本地):0 删除(远程):0 冲突:0 错误:0
+```
+
+也可以通过 **Log** 标签页查看历史日志。
+
+**方式二：Docker Hub 拉取**
+
+如果 NAS 能访问 Docker Hub：
+
+```
+Registry → 搜索 yskigpg/worktile-sync → Download → 选择 tag: v2
+```
+
+然后按上面第 3-4 步创建容器。
+
+> 国内网络可能无法访问 Docker Hub，此时请使用方式一。
+
+**方式三：docker-compose（SSH）**
 
 ```bash
-# 在 NAS 上
+# 在 NAS 上通过 SSH
 docker-compose up -d
 ```
 
@@ -136,9 +189,25 @@ python -m src.main
 - wt-box 跨域接口使用自定义 `x-cookies` Header
 - 详细接口文档见 [CLAUDE.md](CLAUDE.md) 和 [DOWNLOAD_INVESTIGATION.md](DOWNLOAD_INVESTIGATION.md)
 
+## 升级容器
+
+当有新版本时：
+
+1. 停止旧容器（Container → 选中 → Stop）
+2. 导入新镜像（Image → Add From File）
+3. 用新镜像 Launch 新容器，Volume 映射和之前一样
+4. 删除旧容器（可选）
+
+> 升级不会丢失已同步的文件，新容器会复用同步目录中已有的文件。
+> 建议升级前删除容器内的 `sync_state.json`（如果有的话），让新版本重新扫描一次。
+
 ## 注意事项
 
+- **首次同步耗时**：文件数量多时首次全量同步可能需要数小时（串行下载），后续增量同步每轮通常几秒完成
 - **Cookie 过期**：Worktile Cookie 会过期，届时日志会出现认证失败告警，需要重新从浏览器复制 Cookie 并更新 `config.yaml`，然后重启容器
 - **逆向接口风险**：Worktile 版本更新后接口可能变化，需重新抓包适配
 - **首次同步**：建议先设 `dry_run: true` 跑一次确认文件列表正确，再改为 `false`
 - **NAS 存储空间**：首次同步会下载全部文件，确保 NAS 有足够空间
+- **超长文件名**：中文文件名超过 85 个字符（255 字节）会自动截断并加 hash 后缀，不影响同步
+- **错误容忍**：单个文件/文件夹同步失败不会中断整体同步，错误会记录在日志中
+- **健康监控**：每轮同步后会写入 `sync_health.json`，连续 3 轮报错会在日志中输出 CRITICAL 告警
