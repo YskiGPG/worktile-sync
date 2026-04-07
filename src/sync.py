@@ -7,7 +7,7 @@ from pathlib import Path
 
 from .api import WorktileAPI, FileInfo
 from .state import SyncState, FileRecord
-from .utils import should_ignore
+from .utils import should_ignore, safe_name
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +37,7 @@ class SyncEngine:
         self.dry_run = dry_run
         self.ignore_patterns = ignore_patterns or []
         self.state = SyncState.load(state_path)
+        self._consecutive_errors = 0  # 连续出错轮次
 
         self.stats: dict[str, int] = {
             "downloaded": 0, "uploaded": 0, "deleted_local": 0,
@@ -71,6 +72,18 @@ class SyncEngine:
             self.stats["deleted_local"], self.stats["deleted_remote"],
             self.stats["conflicts"], self.stats["errors"],
         )
+
+        # 错误告警
+        if self.stats["errors"] > 0:
+            self._consecutive_errors += 1
+            if self._consecutive_errors >= 3:
+                logger.critical(
+                    "连续 %d 轮同步出现错误！请检查日志和配置（Cookie 是否过期？）",
+                    self._consecutive_errors,
+                )
+        else:
+            self._consecutive_errors = 0
+
         return dict(self.stats)
 
     def _sync_folder(self, folder_id: str, local_path: Path, rel_prefix: str) -> None:
@@ -94,14 +107,20 @@ class SyncEngine:
             if should_ignore(name, self.ignore_patterns):
                 continue
 
-            rel_path = f"{rel_prefix}/{name}" if rel_prefix else name
+            # 截断过长的文件/目录名
+            local_name = safe_name(name)
+            rel_path = f"{rel_prefix}/{local_name}" if rel_prefix else local_name
             remote = remote_map.get(name)
-            local = local_entries.get(name)
+            local = local_entries.get(name) or local_entries.get(local_name)
 
             # 递归处理子文件夹
             if remote and remote.is_folder:
-                sub_local = local_path / name
-                self._sync_folder(remote.id, sub_local, rel_path)
+                sub_local = local_path / local_name
+                try:
+                    self._sync_folder(remote.id, sub_local, rel_path)
+                except Exception:
+                    logger.exception("同步子文件夹失败，跳过: %s", rel_path)
+                    self.stats["errors"] += 1
                 continue
 
             if local and local.is_dir() and not remote:
@@ -113,7 +132,7 @@ class SyncEngine:
 
             # 处理文件同步
             self._sync_file(
-                name=name,
+                name=local_name,
                 rel_path=rel_path,
                 folder_id=folder_id,
                 local_path=local_path,

@@ -83,11 +83,24 @@ def main() -> None:
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
 
+    # 健康状态文件路径（与 sync_state.json 同目录）
+    health_file = state_path.parent / "sync_health.json"
+
     # 主循环
     interval = sync_cfg.get("interval", 60)
     try:
         while _running:
-            engine.sync_once()
+            stats = engine.sync_once()
+            # 写入健康状态文件（方便外部监控）
+            import json
+            health = {
+                "last_sync": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "stats": stats,
+                "status": "error" if stats["errors"] > 0 else "ok",
+            }
+            health_file.write_text(
+                json.dumps(health, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
             # 等待下一轮，支持中途退出
             for _ in range(interval):
                 if not _running:
