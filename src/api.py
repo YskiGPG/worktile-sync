@@ -9,36 +9,34 @@ from typing import Any
 import httpx
 
 from .auth import AuthManager
+from .utils import RateLimiter
 
 logger = logging.getLogger(__name__)
 
-# 重试配置
 MAX_RETRIES = 3
-RETRY_BACKOFF = 2  # 指数退避基数（秒）
+RETRY_BACKOFF = 2
 
 
 @dataclass
 class FileInfo:
     """远程文件/文件夹信息"""
-    id: str           # Worktile _id
-    name: str         # title
-    is_folder: bool   # type==1 为文件夹, type==3 为文件
-    size: int         # addition.size，文件夹为 0
-    mtime: int        # updated_at（Unix 时间戳，秒）
-    parent_id: str    # parent
-    cos_key: str      # addition.path，文件夹为空
-    version: int      # addition.current_version
+    id: str
+    name: str
+    is_folder: bool
+    size: int
+    mtime: int        # updated_at（Unix 秒）
+    parent_id: str
+    cos_key: str
+    version: int
 
 
 class WorktileAPIError(Exception):
-    """API 调用异常"""
     def __init__(self, message: str, status_code: int | None = None) -> None:
         super().__init__(message)
         self.status_code = status_code
 
 
 class WorktileAPI:
-    """Worktile 网盘 API 客户端"""
 
     def __init__(
         self,
@@ -47,16 +45,18 @@ class WorktileAPI:
         team_id: str,
         auth: AuthManager,
         timeout: float = 30.0,
+        rate_limit: float = 5.0,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.box_url = box_url.rstrip("/")
         self.team_id = team_id
         self.auth = auth
+        self._rate_limiter = RateLimiter(rate_limit)
+
         self.client = httpx.Client(
             base_url=self.base_url,
             timeout=httpx.Timeout(timeout, read=300.0),
         )
-        # 上传/下载用单独的 client（跨域，用 x-cookies）
         self.box_client = httpx.Client(
             base_url=self.box_url,
             timeout=httpx.Timeout(timeout, read=600.0),
@@ -64,7 +64,6 @@ class WorktileAPI:
         )
 
     def _ts(self) -> str:
-        """当前毫秒时间戳（防缓存参数）"""
         return str(int(time.time() * 1000))
 
     def _request(
@@ -75,7 +74,8 @@ class WorktileAPI:
         use_box: bool = False,
         **kwargs: Any,
     ) -> httpx.Response:
-        """带重试和认证的通用请求方法"""
+        self._rate_limiter.wait()
+
         if use_box:
             headers = self.auth.get_box_headers()
             client = self.box_client
@@ -113,7 +113,6 @@ class WorktileAPI:
 
     @staticmethod
     def _parse_item(item: dict[str, Any]) -> FileInfo:
-        """将 API 返回的 item 解析为 FileInfo"""
         item_type = item.get("type", 0)
         is_folder = item_type == 1
         addition = item.get("addition") or {}
@@ -129,10 +128,6 @@ class WorktileAPI:
         )
 
     def list_root_folders(self) -> list[FileInfo]:
-        """获取团队网盘根目录文件夹列表
-
-        GET /api/drives/folders?parent_id=&belong=2&sort_by=updated_at&sort_type=-1&t=...
-        """
         resp = self._request("GET", "/api/drives/folders", params={
             "parent_id": "",
             "belong": 2,
@@ -147,11 +142,6 @@ class WorktileAPI:
         return folders
 
     def list_files(self, folder_id: str) -> list[FileInfo]:
-        """获取指定文件夹下的文件和子文件夹列表（处理分页）
-
-        GET /api/drives/list?parent_id={folder_id}&belong=2&pi=0&ps=200&...
-        返回文件和子文件夹混合，通过 type 区分
-        """
         all_items: list[FileInfo] = []
         page = 0
 
@@ -176,7 +166,6 @@ class WorktileAPI:
             for item in items:
                 all_items.append(self._parse_item(item))
 
-            # 检查是否有更多页
             page_count = page_data.get("page_count", 1)
             if page + 1 >= page_count:
                 break
@@ -186,11 +175,7 @@ class WorktileAPI:
         return all_items
 
     def download_file(self, file_info: FileInfo, save_path: Path) -> None:
-        """下载文件到指定路径
-
-        通过 wt-box 服务端下载（服务端自动生成 COS 签名）:
-        GET https://wt-box.worktile.com/drives/{file_id}?team_id={team_id}&version={version}&action=download
-        """
+        """下载文件（临时文件 + 原子 rename + 大小校验）"""
         version = file_info.version or 1
         path = f"/drives/{file_info.id}"
         params = {
@@ -200,6 +185,7 @@ class WorktileAPI:
         }
 
         save_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = save_path.with_suffix(save_path.suffix + ".downloading")
 
         headers = self.auth.get_box_headers()
         last_exc: Exception | None = None
@@ -210,17 +196,27 @@ class WorktileAPI:
                     follow_redirects=True,
                 ) as resp:
                     resp.raise_for_status()
-                    with open(save_path, "wb") as f:
+                    with open(tmp_path, "wb") as f:
                         for chunk in resp.iter_bytes(chunk_size=65536):
                             f.write(chunk)
 
-                logger.info(
-                    "已下载: %s (%d bytes)", save_path.name, save_path.stat().st_size
-                )
+                # 大小校验
+                actual_size = tmp_path.stat().st_size
+                if file_info.size > 0 and actual_size != file_info.size:
+                    tmp_path.unlink(missing_ok=True)
+                    raise WorktileAPIError(
+                        f"下载不完整: {file_info.name} "
+                        f"(期望 {file_info.size}, 实际 {actual_size})"
+                    )
+
+                # 原子 rename
+                tmp_path.rename(save_path)
+                logger.info("已下载: %s (%d bytes)", save_path.name, actual_size)
                 return
 
-            except (httpx.HTTPStatusError, httpx.TransportError) as e:
+            except (httpx.HTTPStatusError, httpx.TransportError, WorktileAPIError) as e:
                 last_exc = e
+                tmp_path.unlink(missing_ok=True)
                 if attempt < MAX_RETRIES:
                     wait = RETRY_BACKOFF ** attempt
                     logger.warning(
@@ -232,11 +228,6 @@ class WorktileAPI:
         raise WorktileAPIError(f"下载失败: {last_exc}") from last_exc
 
     def upload_file(self, folder_id: str, file_path: Path) -> dict[str, Any]:
-        """上传本地文件到指定文件夹
-
-        POST https://wt-box.worktile.com/drive/upload?belong=2&parent_id=...&team_id=...
-        跨域请求，使用 x-cookies Header
-        """
         with open(file_path, "rb") as f:
             resp = self._request(
                 "POST",
@@ -256,18 +247,10 @@ class WorktileAPI:
         return result
 
     def delete_file(self, file_id: str) -> None:
-        """删除远程文件（软删除，移到回收站）
-
-        DELETE /api/drives/{file_id}
-        """
         self._request("DELETE", f"/api/drives/{file_id}")
         logger.info("已删除远程文件: %s", file_id)
 
     def create_folder(self, parent_id: str, name: str) -> str:
-        """创建文件夹，返回新文件夹 ID
-
-        POST /api/drive/folder（注意 drive 和 folder 都是单数）
-        """
         resp = self._request("POST", "/api/drive/folder", json={
             "parent_id": parent_id,
             "title": name,
@@ -283,6 +266,5 @@ class WorktileAPI:
         return folder_id
 
     def close(self) -> None:
-        """关闭 HTTP 客户端"""
         self.client.close()
         self.box_client.close()

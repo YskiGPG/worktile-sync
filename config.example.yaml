@@ -3,25 +3,24 @@
 worktile:
   base_url: "https://zrhubei.worktile.com"
   box_url: "https://wt-box.worktile.com"
-
-  # Team ID（从 Cookie 键名 s-{team_id} 中获取）
   team_id: "YOUR_TEAM_ID"
-
   auth:
-    # 从浏览器 DevTools 中复制完整 Cookie 字符串
     cookie: "s-YOUR_TEAM_ID=YOUR_SESSION_TOKEN"
-
-  # 要同步的根文件夹 ID（留空则同步整个团队网盘）
-  root_folder_id: ""
+  root_folder_id: ""  # 留空=同步全部
 
 sync:
   local_dir: "/data/worktile-sync"
   interval: 60
 
-  # 并发下载线程数（首次同步建议 3-5，日常可设 1）
+  # 并发下载线程数（首次同步建议 3-5）
   max_workers: 3
 
-  # 是否同步删除操作
+  # API 速率限制（每秒最大请求数，避免被封）
+  rate_limit: 5.0
+
+  # 本地文件监听（检测到变化立即同步，需要 watchdog 库）
+  watch_local: false
+
   sync_delete: false
   dry_run: false
 
@@ -30,30 +29,22 @@ sync:
     - "Thumbs.db"
     - "*.tmp"
 
-# 告警通知（可选，至少启用一种通知方式）
 notification:
   enabled: false
-  error_threshold: 3  # 连续错误多少轮后发送通知
-
-  # 邮件通知
+  error_threshold: 3
   email:
     enabled: false
     smtp_host: "smtp.gmail.com"
     smtp_port: 587
-    username: "yskigpg@gmail.com"
-    password: ""  # Gmail 需要应用专用密码（非登录密码）
-    to: "yskigpg@gmail.com"
-
-  # Webhook 通知（支持 Server酱/PushPlus/企业微信机器人）
-  # Server酱(推送到微信): https://sctapi.ftqq.com/YOUR_SENDKEY.send
-  # PushPlus: https://www.pushplus.plus/send?token=YOUR_TOKEN
-  # 企业微信: https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=YOUR_KEY
+    username: ""
+    password: ""
+    to: ""
   webhook:
     enabled: false
-    url: ""
+    url: ""  # Server酱/PushPlus/企业微信 webhook
 
 logging:
   level: "INFO"
   file: "sync.log"
-  max_size_mb: 10     # 单个日志文件最大 MB
-  backup_count: 3     # 保留历史日志份数
+  max_size_mb: 10
+  backup_count: 3

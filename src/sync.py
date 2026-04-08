@@ -1,28 +1,43 @@
-"""核心同步逻辑：双向同步、冲突处理、并发下载"""
+"""核心同步引擎：三阶段模型（扫描 → 计划 → 执行）"""
 
 import logging
 import shutil
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .api import WorktileAPI, FileInfo
-from .state import SyncState, FileRecord
-from .utils import should_ignore, safe_name
+from .state import SyncState, FileRecord, FolderRecord
+from .utils import should_ignore, safe_name, normalize_name, human_size
 
 logger = logging.getLogger(__name__)
 
-# 内部文件，自动忽略不参与同步
-INTERNAL_FILES = {"sync_state.json", "sync_state.tmp", "sync_health.json", "sync_health.tmp"}
+INTERNAL_FILES = {
+    "sync_state.json", "sync_state.tmp",
+    "sync_health.json", "sync_health.tmp",
+    "sync_audit.csv",
+}
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+@dataclass
+class SyncAction:
+    """一个待执行的同步操作"""
+    type: str           # download, upload, delete_local, delete_remote, conflict
+    rel_path: str
+    remote: FileInfo | None = None
+    local_path: Path | None = None
+    folder_id: str = ""
+    remote_mtime: int = 0  # 用于按更新时间排序
+
+
 class SyncEngine:
-    """双向同步引擎"""
+    """三阶段同步引擎: Scan → Plan → Execute"""
 
     def __init__(
         self,
@@ -49,103 +64,68 @@ class SyncEngine:
         self.stats: dict[str, int] = {
             "downloaded": 0, "uploaded": 0, "deleted_local": 0,
             "deleted_remote": 0, "conflicts": 0, "errors": 0,
+            "skipped_folders": 0,
         }
 
     def _should_ignore(self, name: str) -> bool:
-        """检查是否应忽略（用户模式 + 内部文件）"""
         return name in INTERNAL_FILES or should_ignore(name, self.ignore_patterns)
 
-    def sync_once(self) -> dict[str, int]:
-        """执行一次完整同步，返回统计信息"""
-        self.stats = {k: 0 for k in self.stats}
-        self._download_tasks: list[tuple[FileInfo, Path, str]] = []
-        logger.info("开始同步...")
+    # ── Phase 1: Scan ──────────────────────────────────────────────
 
-        try:
-            if self.root_folder_id:
-                self._sync_folder(self.root_folder_id, self.local_dir, "")
-            else:
-                root_folders = self.api.list_root_folders()
-                for folder in root_folders:
-                    if self._should_ignore(folder.name):
-                        continue
-                    sub_local = self.local_dir / folder.name
-                    try:
-                        self._sync_folder(folder.id, sub_local, folder.name)
-                    except Exception:
-                        logger.exception("同步根文件夹失败，跳过: %s", folder.name)
-                        self.stats["errors"] += 1
+    def _scan_folder(
+        self,
+        folder_id: str,
+        local_path: Path,
+        rel_prefix: str,
+        actions: list[SyncAction],
+        folder_mtime: int = 0,
+    ) -> None:
+        """递归扫描文件夹，收集同步动作"""
+        folder_key = rel_prefix or "/"
+        prev_folder = self.state.folders.get(folder_key)
 
-            # 执行并发下载队列
-            self._flush_downloads()
-
-        except Exception:
-            logger.exception("同步过程中发生错误")
-            self.stats["errors"] += 1
-        finally:
-            # 始终保存状态（即使有错误）
-            self.state.save(self.state_path)
-
-        logger.info(
-            "同步完成 — 下载:%d 上传:%d 删除(本地):%d 删除(远程):%d 冲突:%d 错误:%d",
-            self.stats["downloaded"], self.stats["uploaded"],
-            self.stats["deleted_local"], self.stats["deleted_remote"],
-            self.stats["conflicts"], self.stats["errors"],
-        )
-
-        return dict(self.stats)
-
-    def _flush_downloads(self) -> None:
-        """执行所有待下载任务（并发模式）"""
-        if not self._download_tasks:
+        # 文件夹 updated_at 跳过：未变化则跳过整个子树
+        if prev_folder and folder_mtime > 0 and folder_mtime == prev_folder.remote_mtime:
+            self.stats["skipped_folders"] += 1
+            logger.debug("文件夹未变化，跳过: %s", rel_prefix or "/")
             return
 
-        count = len(self._download_tasks)
-        logger.info("开始并发下载 %d 个文件 (workers=%d)", count, self.max_workers)
-
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = [
-                executor.submit(self._do_download, *task)
-                for task in self._download_tasks
-            ]
-            for future in as_completed(futures):
-                pass  # 错误已在 _do_download 中处理
-
-        self._download_tasks.clear()
-
-    def _sync_folder(self, folder_id: str, local_path: Path, rel_prefix: str) -> None:
-        """同步一个文件夹（递归）"""
         local_path.mkdir(parents=True, exist_ok=True)
 
-        # 1. 获取远程文件列表
         remote_items = self.api.list_files(folder_id)
-        remote_map: dict[str, FileInfo] = {f.name: f for f in remote_items}
+        remote_map: dict[str, FileInfo] = {}
+        for f in remote_items:
+            remote_map[normalize_name(f.name)] = f
 
-        # 2. 扫描本地文件
         local_entries: dict[str, Path] = {}
         if local_path.exists():
             for entry in local_path.iterdir():
                 if not self._should_ignore(entry.name):
-                    local_entries[entry.name] = entry
+                    local_entries[normalize_name(entry.name)] = entry
 
         all_names = set(remote_map.keys()) | set(local_entries.keys())
 
-        for name in sorted(all_names):
+        # 按远程更新时间降序排（最近更新的优先）
+        def sort_key(name: str) -> int:
+            r = remote_map.get(name)
+            return -(r.mtime if r else 0)
+
+        for name in sorted(all_names, key=sort_key):
             if self._should_ignore(name):
                 continue
 
             local_name = safe_name(name)
             rel_path = f"{rel_prefix}/{local_name}" if rel_prefix else local_name
             remote = remote_map.get(name)
-            local = local_entries.get(name) or local_entries.get(local_name)
+            local = local_entries.get(name) or local_entries.get(normalize_name(local_name))
 
-            # 递归处理子文件夹
+            # 递归子文件夹
             if remote and remote.is_folder:
                 sub_local = local_path / local_name
                 try:
-                    self._sync_folder(remote.id, sub_local, rel_path)
+                    self._scan_folder(remote.id, sub_local, rel_path, actions, remote.mtime)
                 except Exception:
-                    logger.exception("同步子文件夹失败，跳过: %s", rel_path)
+                    logger.exception("扫描子文件夹失败: %s", rel_path)
                     self.stats["errors"] += 1
                 continue
 
@@ -153,23 +133,28 @@ class SyncEngine:
                 new_id = self._create_remote_folder(folder_id, name)
                 if new_id:
                     try:
-                        self._sync_folder(new_id, local, rel_path)
+                        self._scan_folder(new_id, local, rel_path, actions)
                     except Exception:
-                        logger.exception("同步新建远程文件夹失败，跳过: %s", rel_path)
+                        logger.exception("扫描新建远程文件夹失败: %s", rel_path)
                         self.stats["errors"] += 1
                 continue
 
-            # 处理文件同步
-            self._sync_file(
-                name=local_name,
-                rel_path=rel_path,
-                folder_id=folder_id,
-                local_path=local_path,
-                remote=remote,
-                local=local,
-            )
+            # 生成文件同步动作
+            action = self._decide_action(local_name, rel_path, folder_id, local_path, remote, local)
+            if action:
+                actions.append(action)
 
-    def _sync_file(
+        # 记录文件夹状态
+        effective_mtime = folder_mtime
+        if not effective_mtime and remote_items:
+            effective_mtime = max(f.mtime for f in remote_items)
+        self.state.folders[folder_key] = FolderRecord(
+            remote_id=folder_id,
+            remote_mtime=effective_mtime,
+            last_sync=_now_iso(),
+        )
+
+    def _decide_action(
         self,
         name: str,
         rel_path: str,
@@ -177,35 +162,32 @@ class SyncEngine:
         local_path: Path,
         remote: FileInfo | None,
         local: Path | None,
-    ) -> None:
-        """同步单个文件"""
+    ) -> SyncAction | None:
+        """对单个文件决定同步动作"""
         prev = self.state.files.get(rel_path)
 
-        # Case 1: 远程有，本地没有
+        # Case 1: 远程有，本地无
         if remote and not local:
             if prev:
                 if self.sync_delete:
-                    self._delete_remote(remote, rel_path)
-                else:
-                    logger.debug("本地已删除但未启用删除同步，跳过: %s", rel_path)
-            else:
-                self._download(remote, local_path / name, rel_path)
-            return
+                    return SyncAction("delete_remote", rel_path, remote=remote,
+                                      remote_mtime=remote.mtime)
+                return None
+            return SyncAction("download", rel_path, remote=remote,
+                              local_path=local_path / name, folder_id=folder_id,
+                              remote_mtime=remote.mtime)
 
-        # Case 2: 本地有，远程没有
+        # Case 2: 本地有，远程无
         if local and not remote:
             if prev:
                 if self.sync_delete:
-                    self._delete_local(local, rel_path)
-                else:
-                    logger.debug("远程已删除但未启用删除同步，跳过: %s", rel_path)
-            else:
-                self._upload(folder_id, local, rel_path)
-            return
+                    return SyncAction("delete_local", rel_path, local_path=local)
+                return None
+            return SyncAction("upload", rel_path, local_path=local,
+                              folder_id=folder_id)
 
         # Case 3: 双方都有
         if remote and local and local.is_file():
-            remote_ts = float(remote.mtime)
             local_ts = local.stat().st_mtime
             local_size = local.stat().st_size
 
@@ -217,121 +199,262 @@ class SyncEngine:
             )
 
             if not prev:
-                # 首次同步：双方都有且大小一致 → 视为已同步，直接记录状态
+                # 首次同步：大小一致视为已同步
                 if remote.size == local_size:
-                    logger.debug("首次同步，文件大小一致，跳过: %s", rel_path)
                     self._record_state(rel_path, remote, local)
-                elif remote_ts > local_ts:
-                    self._download(remote, local, rel_path)
-                else:
-                    # 本地更新或时间相同但大小不同 → 以远程为准（保守策略）
-                    self._download(remote, local, rel_path)
+                    return None
+                # 大小不同，以远程为准
+                return SyncAction("download", rel_path, remote=remote,
+                                  local_path=local, folder_id=folder_id,
+                                  remote_mtime=remote.mtime)
             elif remote_changed and local_changed:
-                self._handle_conflict(remote, local, folder_id, rel_path)
+                return SyncAction("conflict", rel_path, remote=remote,
+                                  local_path=local, folder_id=folder_id,
+                                  remote_mtime=remote.mtime)
             elif remote_changed:
-                self._download(remote, local, rel_path)
+                return SyncAction("download", rel_path, remote=remote,
+                                  local_path=local, folder_id=folder_id,
+                                  remote_mtime=remote.mtime)
             elif local_changed:
-                self._upload(folder_id, local, rel_path)
+                return SyncAction("upload", rel_path, local_path=local,
+                                  folder_id=folder_id)
 
-    def _download(self, remote: FileInfo, save_path: Path, rel_path: str) -> None:
-        """下载文件（串行直接执行，并发加入队列）"""
-        if self.dry_run:
-            logger.info("[DRY-RUN] 将下载: %s", rel_path)
+        return None
+
+    # ── Phase 2: Plan ──────────────────────────────────────────────
+
+    def _plan(self, actions: list[SyncAction]) -> None:
+        """分析、排序、报告同步计划"""
+        downloads = [a for a in actions if a.type == "download"]
+        uploads = [a for a in actions if a.type == "upload"]
+        del_local = [a for a in actions if a.type == "delete_local"]
+        del_remote = [a for a in actions if a.type == "delete_remote"]
+        conflicts = [a for a in actions if a.type == "conflict"]
+
+        dl_size = sum(a.remote.size for a in downloads if a.remote)
+        ul_size = sum(
+            a.local_path.stat().st_size for a in uploads
+            if a.local_path and a.local_path.exists()
+        )
+
+        logger.info(
+            "同步计划 — 下载:%d (%s) 上传:%d (%s) 删除(本地):%d 删除(远程):%d 冲突:%d 跳过文件夹:%d",
+            len(downloads), human_size(dl_size),
+            len(uploads), human_size(ul_size),
+            len(del_local), len(del_remote), len(conflicts),
+            self.stats["skipped_folders"],
+        )
+
+        # 按更新时间排序（最近更新的优先）
+        actions.sort(key=lambda a: -a.remote_mtime)
+
+        # 重命名检测
+        self._detect_renames(actions)
+
+    def _detect_renames(self, actions: list[SyncAction]) -> None:
+        """检测可能的重命名（仅日志，Worktile 无 rename API）"""
+        del_remotes = {a.rel_path: a for a in actions
+                       if a.type == "delete_remote" and a.remote}
+        uploads = {a.rel_path: a for a in actions
+                   if a.type == "upload" and a.local_path and a.local_path.exists()}
+
+        for del_path, del_a in del_remotes.items():
+            del_size = del_a.remote.size
+            for up_path, up_a in uploads.items():
+                if up_a.local_path.stat().st_size == del_size and del_path != up_path:
+                    logger.info("检测到可能的重命名: %s → %s (大小: %s)",
+                                del_path, up_path, human_size(del_size))
+                    break
+
+    # ── Phase 3: Execute ───────────────────────────────────────────
+
+    def _execute(self, actions: list[SyncAction]) -> None:
+        """执行所有同步动作"""
+        if not actions:
             return
 
-        if self.max_workers > 1:
-            self._download_tasks.append((remote, save_path, rel_path))
-        else:
-            self._do_download(remote, save_path, rel_path)
+        total = len(actions)
+        downloads = [a for a in actions if a.type == "download"]
+        others = [a for a in actions if a.type != "download"]
 
-    def _do_download(self, remote: FileInfo, save_path: Path, rel_path: str) -> None:
-        """执行实际下载"""
+        completed = 0
+
+        # 先执行非下载操作（上传、删除、冲突 — 通常较快）
+        for action in others:
+            if self.dry_run:
+                logger.info("[DRY-RUN] %s: %s", action.type, action.rel_path)
+            else:
+                self._exec_one(action)
+            completed += 1
+            if completed % 20 == 0:
+                logger.info("进度: %d/%d (%.0f%%)", completed, total, completed / total * 100)
+
+        # 执行下载（可并发）
+        if downloads:
+            if self.dry_run:
+                for a in downloads:
+                    logger.info("[DRY-RUN] download: %s", a.rel_path)
+                    completed += 1
+            elif self.max_workers > 1 and len(downloads) > 1:
+                logger.info("开始并发下载 %d 个文件 (workers=%d)",
+                            len(downloads), self.max_workers)
+                with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                    futures = {executor.submit(self._exec_download, a): a for a in downloads}
+                    for future in as_completed(futures):
+                        completed += 1
+                        if completed % 20 == 0:
+                            logger.info("进度: %d/%d (%.0f%%)",
+                                        completed, total, completed / total * 100)
+                        self._maybe_save_state()
+            else:
+                for action in downloads:
+                    self._exec_download(action)
+                    completed += 1
+                    if completed % 20 == 0:
+                        logger.info("进度: %d/%d (%.0f%%)",
+                                    completed, total, completed / total * 100)
+                    self._maybe_save_state()
+
+    def _maybe_save_state(self) -> None:
+        """增量保存状态（每 50 个下载保存一次）"""
+        with self._lock:
+            if self.stats["downloaded"] > 0 and self.stats["downloaded"] % 50 == 0:
+                self.state.save(self.state_path)
+                logger.debug("增量保存状态: %d 个文件", self.stats["downloaded"])
+
+    def _exec_one(self, action: SyncAction) -> None:
+        if action.type == "upload":
+            self._exec_upload(action)
+        elif action.type == "delete_local":
+            self._exec_delete_local(action)
+        elif action.type == "delete_remote":
+            self._exec_delete_remote(action)
+        elif action.type == "conflict":
+            self._exec_conflict(action)
+
+    def _exec_download(self, action: SyncAction) -> None:
         try:
-            self.api.download_file(remote, save_path)
+            self.api.download_file(action.remote, action.local_path)
             with self._lock:
-                self._record_state(rel_path, remote, save_path)
+                self._record_state(action.rel_path, action.remote, action.local_path)
                 self.stats["downloaded"] += 1
         except Exception:
-            logger.exception("下载失败: %s", rel_path)
+            logger.exception("下载失败: %s", action.rel_path)
             with self._lock:
                 self.stats["errors"] += 1
 
-    def _upload(self, folder_id: str, file_path: Path, rel_path: str) -> None:
-        if self.dry_run:
-            logger.info("[DRY-RUN] 将上传: %s", rel_path)
-            return
-
+    def _exec_upload(self, action: SyncAction) -> None:
         try:
-            result = self.api.upload_file(folder_id, file_path)
+            result = self.api.upload_file(action.folder_id, action.local_path)
             data = result.get("data", result)
             remote_info = FileInfo(
                 id=data.get("_id", ""),
-                name=file_path.name,
+                name=action.local_path.name,
                 is_folder=False,
-                size=file_path.stat().st_size,
+                size=action.local_path.stat().st_size,
                 mtime=data.get("updated_at", int(datetime.now().timestamp())),
-                parent_id=folder_id,
+                parent_id=action.folder_id,
                 cos_key=data.get("addition", {}).get("path", ""),
                 version=data.get("addition", {}).get("current_version", 1),
             )
-            self._record_state(rel_path, remote_info, file_path)
+            self._record_state(action.rel_path, remote_info, action.local_path)
             self.stats["uploaded"] += 1
         except Exception:
-            logger.exception("上传失败: %s", rel_path)
+            logger.exception("上传失败: %s", action.rel_path)
             self.stats["errors"] += 1
 
-    def _delete_local(self, path: Path, rel_path: str) -> None:
-        if self.dry_run:
-            logger.info("[DRY-RUN] 将删除本地: %s", rel_path)
-            return
+    def _exec_delete_local(self, action: SyncAction) -> None:
         try:
-            if path.is_dir():
-                shutil.rmtree(path)
+            if action.local_path.is_dir():
+                shutil.rmtree(action.local_path)
             else:
-                path.unlink()
-            self.state.files.pop(rel_path, None)
+                action.local_path.unlink()
+            self.state.files.pop(action.rel_path, None)
             self.stats["deleted_local"] += 1
-            logger.info("已删除本地文件: %s", rel_path)
+            logger.info("已删除本地: %s", action.rel_path)
         except Exception:
-            logger.exception("删除本地文件失败: %s", rel_path)
+            logger.exception("删除本地失败: %s", action.rel_path)
             self.stats["errors"] += 1
 
-    def _delete_remote(self, remote: FileInfo, rel_path: str) -> None:
-        if self.dry_run:
-            logger.info("[DRY-RUN] 将删除远程: %s", rel_path)
-            return
+    def _exec_delete_remote(self, action: SyncAction) -> None:
         try:
-            self.api.delete_file(remote.id)
-            self.state.files.pop(rel_path, None)
+            self.api.delete_file(action.remote.id)
+            self.state.files.pop(action.rel_path, None)
             self.stats["deleted_remote"] += 1
         except Exception:
-            logger.exception("删除远程文件失败: %s", rel_path)
+            logger.exception("删除远程失败: %s", action.rel_path)
             self.stats["errors"] += 1
 
-    def _handle_conflict(
-        self, remote: FileInfo, local_path: Path, folder_id: str, rel_path: str
-    ) -> None:
+    def _exec_conflict(self, action: SyncAction) -> None:
         self.stats["conflicts"] += 1
-        remote_ts = float(remote.mtime)
-        local_ts = local_path.stat().st_mtime
+        remote_ts = float(action.remote.mtime)
+        local_ts = action.local_path.stat().st_mtime
 
-        stem = local_path.stem
-        suffix = local_path.suffix
-        conflict_name = f"{stem}.conflict{suffix}"
-        conflict_path = local_path.parent / conflict_name
+        stem = action.local_path.stem
+        suffix = action.local_path.suffix
+        conflict_path = action.local_path.parent / f"{stem}.conflict{suffix}"
 
         if remote_ts >= local_ts:
-            logger.info("冲突：远程更新，备份本地文件: %s -> %s", rel_path, conflict_name)
-            if not self.dry_run:
-                shutil.copy2(local_path, conflict_path)
-                self._download(remote, local_path, rel_path)
+            logger.info("冲突(远程更新): %s → 备份 %s", action.rel_path, conflict_path.name)
+            shutil.copy2(action.local_path, conflict_path)
+            self._exec_download(action)
         else:
-            logger.info("冲突：本地更新，上传本地文件: %s", rel_path)
-            self._upload(folder_id, local_path, rel_path)
+            logger.info("冲突(本地更新): %s → 上传", action.rel_path)
+            self._exec_upload(action)
+
+    # ── Orchestrator ───────────────────────────────────────────────
+
+    def sync_once(self) -> dict[str, int]:
+        """执行一次完整的三阶段同步"""
+        self.stats = {k: 0 for k in self.stats}
+        actions: list[SyncAction] = []
+
+        # Phase 1: Scan
+        logger.info("开始扫描...")
+        try:
+            if self.root_folder_id:
+                self._scan_folder(self.root_folder_id, self.local_dir, "", actions)
+            else:
+                root_folders = self.api.list_root_folders()
+                for folder in root_folders:
+                    if self._should_ignore(folder.name):
+                        continue
+                    sub_local = self.local_dir / folder.name
+                    try:
+                        self._scan_folder(folder.id, sub_local, folder.name, actions, folder.mtime)
+                    except Exception:
+                        logger.exception("扫描根文件夹失败: %s", folder.name)
+                        self.stats["errors"] += 1
+        except Exception:
+            logger.exception("扫描阶段发生错误")
+            self.stats["errors"] += 1
+
+        # Phase 2: Plan
+        self._plan(actions)
+
+        if not actions:
+            logger.info("无需同步")
+        else:
+            # Phase 3: Execute
+            self._execute(actions)
+
+        # 始终保存状态
+        self.state.save(self.state_path)
+
+        logger.info(
+            "同步完成 — 下载:%d 上传:%d 删除(本地):%d 删除(远程):%d 冲突:%d 错误:%d",
+            self.stats["downloaded"], self.stats["uploaded"],
+            self.stats["deleted_local"], self.stats["deleted_remote"],
+            self.stats["conflicts"], self.stats["errors"],
+        )
+
+        return dict(self.stats)
+
+    # ── Helpers ────────────────────────────────────────────────────
 
     def _create_remote_folder(self, parent_id: str, name: str) -> str:
         if self.dry_run:
-            logger.info("[DRY-RUN] 将创建远程文件夹: %s", name)
+            logger.info("[DRY-RUN] 创建远程文件夹: %s", name)
             return ""
         try:
             return self.api.create_folder(parent_id, name)
@@ -340,9 +463,7 @@ class SyncEngine:
             self.stats["errors"] += 1
             return ""
 
-    def _record_state(
-        self, rel_path: str, remote: FileInfo, local_path: Path
-    ) -> None:
+    def _record_state(self, rel_path: str, remote: FileInfo, local_path: Path) -> None:
         stat = local_path.stat() if local_path.exists() else None
         self.state.files[rel_path] = FileRecord(
             name=remote.name,

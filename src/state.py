@@ -1,4 +1,4 @@
-"""同步状态持久化：记录每个文件的同步状态"""
+"""同步状态持久化：记录每个文件和文件夹的同步状态"""
 
 import json
 import logging
@@ -8,35 +8,45 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-STATE_FILE = "sync_state.json"
-
 
 @dataclass
 class FileRecord:
     """单个文件的同步记录"""
     name: str
     remote_id: str
-    remote_mtime: int  # Worktile updated_at Unix 时间戳（秒）
+    remote_mtime: int
     remote_size: int
-    local_mtime: float  # os.path.getmtime 返回的 timestamp
+    local_mtime: float
     local_size: int
-    last_sync: str  # 最后一次同步的 ISO 时间
-    cos_key: str = ""  # COS 文件 key
+    last_sync: str
+    cos_key: str = ""
+
+
+@dataclass
+class FolderRecord:
+    """文件夹的同步记录（用于跳过未变化的文件夹）"""
+    remote_id: str
+    remote_mtime: int
+    last_sync: str
 
 
 @dataclass
 class SyncState:
     """完整的同步状态"""
-    # key = 相对路径（如 "docs/readme.txt"）
     files: dict[str, FileRecord] = field(default_factory=dict)
+    folders: dict[str, FolderRecord] = field(default_factory=dict)
 
     def save(self, path: Path) -> None:
-        """持久化状态到 JSON 文件（原子写入：先写临时文件再 rename）"""
-        data = {k: asdict(v) for k, v in self.files.items()}
+        """持久化状态到 JSON 文件（原子写入）"""
+        data = {
+            "files": {k: asdict(v) for k, v in self.files.items()},
+            "folders": {k: asdict(v) for k, v in self.folders.items()},
+        }
         tmp_path = path.with_suffix(".tmp")
         tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp_path.rename(path)
-        logger.debug("同步状态已保存到 %s", path)
+        logger.debug("同步状态已保存到 %s (%d 个文件, %d 个文件夹)",
+                      path, len(self.files), len(self.folders))
 
     @classmethod
     def load(cls, path: Path) -> "SyncState":
@@ -46,9 +56,20 @@ class SyncState:
             return cls()
 
         try:
-            data: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
-            files = {k: FileRecord(**v) for k, v in data.items()}
-            return cls(files=files)
+            raw: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
+
+            # 兼容旧格式（v1/v2 没有 folders 字段，files 直接是顶层 dict）
+            if "files" in raw and isinstance(raw["files"], dict):
+                files_raw = raw["files"]
+                folders_raw = raw.get("folders", {})
+            else:
+                # 旧格式：整个 JSON 就是 files
+                files_raw = raw
+                folders_raw = {}
+
+            files = {k: FileRecord(**v) for k, v in files_raw.items()}
+            folders = {k: FolderRecord(**v) for k, v in folders_raw.items()}
+            return cls(files=files, folders=folders)
         except (json.JSONDecodeError, TypeError) as e:
             logger.warning("状态文件损坏，将重新同步: %s", e)
             return cls()
