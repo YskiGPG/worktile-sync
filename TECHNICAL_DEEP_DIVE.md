@@ -1003,25 +1003,127 @@ pytest tests/ -v
 
 ---
 
-## 15. 未来改进方向
+## 15. v4 新增特性详解
 
-### 短期
+### 三阶段同步架构
 
-- [ ] **增量 API**：如果 Worktile 有"最近修改的文件"接口，可以避免每次全量遍历
-- [ ] **并发上传**：当前上传是串行的，可以用类似下载的队列模式并发化
-- [ ] **MD5 校验**：下载后验证文件完整性（当前只比较大小）
+v4 将同步过程从"遍历即执行"重构为三个阶段：
 
-### 中期
+```
+Phase 1: Scan（扫描）
+  ├─ 递归遍历远程+本地文件树
+  ├─ 文件夹 updated_at 快速跳过（未变化直接跳过子树）
+  ├─ 对每个文件生成 SyncAction（download/upload/delete/conflict）
+  └─ 输出: list[SyncAction]
 
-- [ ] **Cookie 自动刷新**：通过无头浏览器（Playwright/Puppeteer）自动登录刷新 Cookie
-- [ ] **Web 管理界面**：简单的 Flask 页面，展示同步状态、手动触发同步、更新 Cookie
-- [ ] **文件变更监听**：用 inotify/fswatch 监听本地文件变化，触发即时同步（而不是等轮询）
+Phase 2: Plan（计划）
+  ├─ 统计：下载 N 个 (X MB), 上传 M 个 (Y MB), ...
+  ├─ 按 updated_at 降序排列（最近修改优先）
+  ├─ 重命名检测（同大小 delete+upload 配对）
+  └─ 输出: 排序后的 list[SyncAction]
 
-### 长期
+Phase 3: Execute（执行）
+  ├─ 先执行上传/删除/冲突（通常较快）
+  ├─ 再并发执行下载（ThreadPoolExecutor）
+  ├─ 每 20 个操作报告进度
+  ├─ 每 50 个下载增量保存状态
+  └─ 输出: stats
+```
 
+### 文件夹 updated_at 快速跳过
+
+这是增量同步性能提升最大的优化。原理：
+
+```python
+# state 中记录每个文件夹的 updated_at
+FolderRecord(remote_id="xxx", remote_mtime=1775574801, ...)
+
+# 下一轮同步时，比较 API 返回的 mtime 与记录的 mtime
+if folder_mtime == prev_folder.remote_mtime:
+    # 文件夹内容未变化，跳过整个子树（不调 list_files API）
+    return
+```
+
+效果：500 个文件夹 → 只扫描有变化的几个 → API 调用从 500+ 降到 ~10。
+
+### 临时文件 + 大小校验
+
+```python
+# 下载到临时文件
+tmp_path = save_path.with_suffix(".downloading")
+# 下载完毕后校验大小
+if actual_size != expected_size:
+    tmp_path.unlink()  # 删除不完整的文件
+    raise Error(...)
+# 原子 rename
+tmp_path.rename(save_path)
+```
+
+好处：
+- 断电/crash 不会留下半成品文件
+- 大小不一致自动重试
+- `.downloading` 文件可以被清理
+
+### 速率限制
+
+```python
+class RateLimiter:
+    """令牌桶：每秒最多 N 次 API 调用"""
+    def wait(self):
+        with self._lock:
+            elapsed = now - self._last_call
+            if elapsed < self._min_interval:
+                sleep(self._min_interval - elapsed)
+```
+
+所有 API 调用经过 `_request()`，自动限速。默认 5 次/秒。
+
+### 配置热重载
+
+```python
+# 每轮同步前检查 config.yaml 的 mtime
+if config_mtime changed:
+    reload config → update auth → update notifier
+```
+
+最重要的场景：Cookie 过期后，用户更新 config.yaml 中的 Cookie，不需要重启容器。
+
+### 审计日志
+
+每轮同步追加一行到 `sync_audit.csv`：
+
+```csv
+timestamp,duration_sec,downloaded,uploaded,deleted_local,deleted_remote,conflicts,errors,skipped_folders
+2026-04-08 12:00:00,3.2,0,0,0,0,0,0,48
+2026-04-08 12:01:00,45.1,5,1,0,0,0,0,3
+```
+
+方便回溯"哪天同步了什么"，也可以用 Excel/Pandas 分析趋势。
+
+### 本地文件监听
+
+```python
+# 使用 watchdog 库监听文件系统事件
+watcher = LocalWatcher(local_dir, ignore_check)
+watcher.start()
+
+# 主循环中检测变化，提前触发同步
+for _ in range(interval):
+    if watcher.has_changes():
+        break  # 不等 60 秒，立即同步
+    sleep(1)
+```
+
+Docker 环境中 inotify 对 volume mount 的支持取决于存储驱动，不保证所有环境都能用。设为可选功能（`watch_local: true`）。
+
+## 16. 未来改进方向
+
+- [ ] **Cookie 自动刷新**：通过无头浏览器自动登录
+- [ ] **Web 管理界面**：展示状态、手动触发、更新 Cookie
+- [ ] **并发上传**：类似下载的队列模式
 - [ ] **多团队支持**：同时同步多个 Worktile 团队
 - [ ] **选择性同步**：通过 UI 选择要同步的文件夹
-- [ ] **版本历史**：利用 Worktile 的版本机制保留文件历史
+- [ ] **版本历史**：利用 Worktile 的版本机制保留历史
 
 ---
 
@@ -1040,6 +1142,8 @@ sync:
   local_dir: "/data/worktile-sync"
   interval: 60
   max_workers: 3
+  rate_limit: 5.0
+  watch_local: false
   sync_delete: false
   dry_run: false
   ignore_patterns:
