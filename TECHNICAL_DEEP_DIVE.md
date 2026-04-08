@@ -726,19 +726,30 @@ else:
 | v1 | `/app/sync_state.json`（容器内） | 容器删除重建后丢失 |
 | v3 | `/data/worktile-sync/sync_state.json`（同步目录） | 随 Volume 持久化 |
 
-### 内部文件自动忽略
+### 监控文件同步到 Worktile
 
-状态文件放在同步目录里，但不应该被同步到 Worktile：
+v4 的设计选择：监控文件（health/progress/state/audit）**允许同步到 Worktile**，这样用户可以在 Worktile 网页端直接预览同步状态，无需登录 NAS。
+
+只有 `.tmp` 临时文件被忽略（防止写到一半的文件被同步）：
 
 ```python
-INTERNAL_FILES = {"sync_state.json", "sync_state.tmp", 
-                  "sync_health.json", "sync_health.tmp"}
+# 只排除临时文件
+INTERNAL_FILES = {"sync_state.tmp", "sync_health.tmp", "sync_progress.tmp"}
+
+# 群晖系统目录始终忽略
+NAS_SYSTEM_DIRS = {"@eaDir", "#recycle", "@tmp"}
 
 def _should_ignore(self, name):
-    return name in INTERNAL_FILES or should_ignore(name, self.ignore_patterns)
+    return (name in INTERNAL_FILES
+            or name in NAS_SYSTEM_DIRS
+            or should_ignore(name, self.ignore_patterns))
 ```
 
-这比依赖用户配置 `ignore_patterns` 更可靠。
+可在 Worktile 上直接预览的文件：
+- `sync_health.json` — 最后一轮同步结果 + 变更明细
+- `sync_progress.json` — 实时同步进度
+- `sync_state.json` — 全量文件状态记录
+- `sync_audit.csv` — 历史同步统计（可用 Excel 打开）
 
 ### 状态丢失的后果与缓解
 

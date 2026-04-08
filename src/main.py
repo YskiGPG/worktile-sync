@@ -43,8 +43,15 @@ def _write_health(health_file: Path, data: dict) -> None:
     tmp.rename(health_file)
 
 
+MAX_AUDIT_SIZE = 10 * 1024 * 1024  # 10MB
+
+
 def _write_audit(audit_file: Path, stats: dict, duration: float) -> None:
-    """追加同步审计记录到 CSV"""
+    """追加同步审计记录到 CSV（超过 10MB 自动轮转）"""
+    if audit_file.exists() and audit_file.stat().st_size > MAX_AUDIT_SIZE:
+        rotated = audit_file.with_suffix(".csv.old")
+        rotated.unlink(missing_ok=True)
+        audit_file.rename(rotated)
     header_needed = not audit_file.exists()
     with open(audit_file, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)

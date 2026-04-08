@@ -14,11 +14,13 @@ from .utils import should_ignore, safe_name, normalize_name, human_size
 
 logger = logging.getLogger(__name__)
 
+# 临时文件不参与同步，正式监控文件允许同步到 Worktile 供远程预览
 INTERNAL_FILES = {
-    "sync_state.json", "sync_state.tmp",
-    "sync_progress.json", "sync_progress.tmp",
-    "sync_audit.csv",
-    # sync_health.json 故意不在此列表 → 允许同步到 Worktile 供远程预览
+    "sync_state.tmp",
+    "sync_health.tmp",
+    "sync_progress.tmp",
+    # sync_state.json, sync_health.json, sync_progress.json, sync_audit.csv
+    # 故意不在此列表 → 允许同步到 Worktile
 }
 
 # 群晖系统目录，始终忽略
@@ -68,6 +70,8 @@ class SyncEngine:
         self._sync_start = 0.0
         self._total_actions = 0
         self._recent_changes: list[dict] = []
+        self._folders_scanned = 0
+        self._folders_skipped = 0
 
         self.stats: dict[str, int] = {
             "downloaded": 0, "uploaded": 0, "deleted_local": 0,
@@ -97,10 +101,20 @@ class SyncEngine:
         # 文件夹 updated_at 跳过：未变化则跳过整个子树
         if prev_folder and folder_mtime > 0 and folder_mtime == prev_folder.remote_mtime:
             self.stats["skipped_folders"] += 1
+            self._folders_skipped += 1
             logger.debug("文件夹未变化，跳过: %s", rel_prefix or "/")
             return
 
         local_path.mkdir(parents=True, exist_ok=True)
+
+        self._folders_scanned += 1
+        if self._folders_scanned % 10 == 0:
+            self._write_progress(
+                "scanning",
+                0,
+                f"已扫描 {self._folders_scanned} 个文件夹, "
+                f"跳过 {self._folders_skipped} 个 — {rel_prefix or '/'}",
+            )
 
         remote_items = self.api.list_files(folder_id)
         remote_map: dict[str, FileInfo] = {}
@@ -469,6 +483,8 @@ class SyncEngine:
         import time as _time
         self._sync_start = _time.monotonic()
         self._recent_changes = []
+        self._folders_scanned = 0
+        self._folders_skipped = 0
 
         # Phase 1: Scan
         logger.info("开始扫描...")

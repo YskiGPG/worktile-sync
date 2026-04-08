@@ -164,18 +164,63 @@ python -m src.main
 | 一方删除（`sync_delete: true`） | 另一方也删除 |
 | 一方删除（`sync_delete: false`） | 不处理，保留另一方的文件 |
 
+## 监控文件
+
+同步目录下会自动生成以下监控文件，**全部同步到 Worktile** 可直接在网页端预览：
+
+| 文件 | 说明 | 更新频率 |
+|------|------|---------|
+| `sync_health.json` | 最后一轮同步结果、统计、变更明细 | 每轮同步结束 |
+| `sync_progress.json` | 实时同步进度（阶段、已完成/总数、当前文件） | 扫描/下载过程中每 10 个文件夹 |
+| `sync_state.json` | 所有文件的同步状态记录 | 每轮同步结束 + 增量保存 |
+| `sync_audit.csv` | 历史同步统计（CSV 格式，可用 Excel 打开） | 每轮追加一行 |
+
+### sync_health.json 示例
+
+```json
+{
+  "last_sync": "2026-04-08 19:30:00",
+  "duration_sec": 3.2,
+  "status": "ok",
+  "stats": {"downloaded": 2, "uploaded": 1, "errors": 0, ...},
+  "recent_changes": [
+    {"action": "download", "direction": "worktile → 本地", "file": "合同.pdf", "size": 1234567},
+    {"action": "upload", "direction": "本地 → worktile", "file": "报告.docx", "size": 45678}
+  ]
+}
+```
+
+### sync_progress.json 示例（同步进行中）
+
+```json
+{
+  "status": "syncing",
+  "phase": "downloading",
+  "current_file": "已扫描 350 个文件夹, 跳过 280 个",
+  "completed": 15,
+  "total": 20,
+  "percent": 75.0,
+  "downloaded": 13,
+  "elapsed_sec": 45.2
+}
+```
+
 ## 项目结构
 
 ```
 ├── src/
-│   ├── main.py    # 入口，主循环
-│   ├── api.py     # Worktile 接口封装（列表/下载/上传/删除/创建文件夹）
-│   ├── auth.py    # 认证管理（Cookie / x-cookies）
-│   ├── sync.py    # 双向同步引擎
-│   ├── state.py   # 同步状态持久化（JSON）
-│   └── utils.py   # 工具函数
+│   ├── main.py      # 入口：主循环、配置热重载、审计、通知
+│   ├── api.py       # Worktile API 封装（速率限制、临时文件下载、大小校验）
+│   ├── auth.py      # 认证管理（Cookie / x-cookies）
+│   ├── sync.py      # 三阶段同步引擎（扫描 → 计划 → 执行）
+│   ├── state.py     # 同步状态持久化（原子写入、文件夹缓存）
+│   ├── notify.py    # 通知（邮件 + Webhook）
+│   ├── watcher.py   # 本地文件监听（可选，watchdog）
+│   └── utils.py     # 工具函数（日志轮转、文件名截断、速率限制）
 ├── tools/
-│   └── probe_download.py  # 下载接口探测脚本
+│   ├── probe_download.py   # 下载接口探测脚本
+│   ├── dedup_remote.py     # 远程重复文件清理
+│   └── cleanup_eadir.py    # @eaDir 清理
 ├── config.example.yaml
 ├── Dockerfile
 ├── docker-compose.yml
@@ -211,11 +256,12 @@ python -m src.main
 
 ## 注意事项
 
-- **首次同步耗时**：文件数量多时首次全量同步可能需要数小时（串行下载），后续增量同步每轮通常几秒完成
-- **Cookie 过期**：Worktile Cookie 会过期，届时日志会出现认证失败告警，需要重新从浏览器复制 Cookie 并更新 `config.yaml`，然后重启容器
+- **首次同步耗时**：文件数量多时首次全量同步可能需要数小时，后续增量同步通常几秒（文件夹跳过优化）
+- **首次扫描慢**：v4 首次运行需要扫描所有文件夹建立缓存（~4000 个文件夹约 30 分钟），之后未变化的文件夹自动跳过
+- **Cookie 过期**：更新 `config.yaml` 中的 Cookie 后自动生效（配置热重载），无需重启容器
 - **逆向接口风险**：Worktile 版本更新后接口可能变化，需重新抓包适配
-- **首次同步**：建议先设 `dry_run: true` 跑一次确认文件列表正确，再改为 `false`
 - **NAS 存储空间**：首次同步会下载全部文件，确保 NAS 有足够空间
-- **超长文件名**：中文文件名超过 85 个字符（255 字节）会自动截断并加 hash 后缀，不影响同步
-- **错误容忍**：单个文件/文件夹同步失败不会中断整体同步，错误会记录在日志中
-- **健康监控**：每轮同步后会写入 `sync_health.json`，连续 3 轮报错会在日志中输出 CRITICAL 告警
+- **超长文件名**：中文文件名超过 85 个字符（255 字节）会自动截断并加 hash 后缀
+- **群晖系统目录**：`@eaDir`、`#recycle` 等群晖系统目录自动忽略
+- **监控文件**：`sync_health.json`、`sync_progress.json`、`sync_state.json`、`sync_audit.csv` 全部同步到 Worktile，可在网页端直接预览
+- **变更通知**：`notify_on_change: true` 时，文件有变更会推送 Server酱/邮件通知；连续错误自动告警
