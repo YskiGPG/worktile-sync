@@ -217,12 +217,15 @@ class SyncEngine:
             )
 
             if not prev:
-                if remote_ts > local_ts:
-                    self._download(remote, local, rel_path)
-                elif local_ts > remote_ts:
-                    self._upload(folder_id, local, rel_path)
-                else:
+                # 首次同步：双方都有且大小一致 → 视为已同步，直接记录状态
+                if remote.size == local_size:
+                    logger.debug("首次同步，文件大小一致，跳过: %s", rel_path)
                     self._record_state(rel_path, remote, local)
+                elif remote_ts > local_ts:
+                    self._download(remote, local, rel_path)
+                else:
+                    # 本地更新或时间相同但大小不同 → 以远程为准（保守策略）
+                    self._download(remote, local, rel_path)
             elif remote_changed and local_changed:
                 self._handle_conflict(remote, local, folder_id, rel_path)
             elif remote_changed:
