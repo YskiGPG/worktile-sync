@@ -351,13 +351,13 @@ class SyncEngine:
                 logger.debug("增量保存状态: %d 个文件", self.stats["downloaded"])
 
     def _write_progress(self, phase: str, completed: int, current: str = "") -> None:
-        """实时写入同步进度文件（供外部监控）"""
+        """实时写入同步进度文件（保留每个阶段最近 20 条历史）"""
         import json, time as _time
         elapsed = _time.monotonic() - self._sync_start
         total = self._total_actions
         pct = (completed / total * 100) if total > 0 else 0
-        data = {
-            "status": "syncing",
+
+        snapshot = {
             "phase": phase,
             "current_file": current,
             "completed": completed,
@@ -369,12 +369,33 @@ class SyncEngine:
             "elapsed_sec": round(elapsed, 1),
             "updated_at": _time.strftime("%Y-%m-%d %H:%M:%S"),
         }
+
         try:
+            # 读取现有进度文件
+            existing = {}
+            if self._progress_file.exists():
+                try:
+                    existing = json.loads(self._progress_file.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, OSError):
+                    pass
+
+            history = existing.get("history", {})
+            phase_history = history.get(phase, [])
+            phase_history.insert(0, snapshot)  # 最新在前
+            phase_history = phase_history[:20]  # 保留 20 条
+            history[phase] = phase_history
+
+            data = {
+                "status": "syncing",
+                "current": snapshot,
+                "history": history,
+            }
+
             tmp = self._progress_file.with_suffix(".tmp")
             tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
             tmp.rename(self._progress_file)
         except Exception:
-            pass  # 进度文件写入失败不影响同步
+            pass
 
     def _exec_one(self, action: SyncAction) -> None:
         if action.type == "upload":
