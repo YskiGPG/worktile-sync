@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 INTERNAL_FILES = {
     "sync_state.json", "sync_state.tmp",
     "sync_health.json", "sync_health.tmp",
+    "sync_progress.json", "sync_progress.tmp",
     "sync_audit.csv",
 }
 
@@ -60,6 +61,9 @@ class SyncEngine:
         self.max_workers = max(1, max_workers)
         self.state = SyncState.load(state_path)
         self._lock = threading.Lock()
+        self._progress_file = local_dir / "sync_progress.json"
+        self._sync_start = 0.0
+        self._total_actions = 0
 
         self.stats: dict[str, int] = {
             "downloaded": 0, "uploaded": 0, "deleted_local": 0,
@@ -288,6 +292,7 @@ class SyncEngine:
             completed += 1
             if completed % 20 == 0:
                 logger.info("进度: %d/%d (%.0f%%)", completed, total, completed / total * 100)
+            self._write_progress("uploading", completed, action.rel_path)
 
         # 执行下载（可并发）
         if downloads:
@@ -301,10 +306,12 @@ class SyncEngine:
                 with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                     futures = {executor.submit(self._exec_download, a): a for a in downloads}
                     for future in as_completed(futures):
+                        action = futures[future]
                         completed += 1
                         if completed % 20 == 0:
                             logger.info("进度: %d/%d (%.0f%%)",
                                         completed, total, completed / total * 100)
+                        self._write_progress("downloading", completed, action.rel_path)
                         self._maybe_save_state()
             else:
                 for action in downloads:
@@ -313,6 +320,7 @@ class SyncEngine:
                     if completed % 20 == 0:
                         logger.info("进度: %d/%d (%.0f%%)",
                                     completed, total, completed / total * 100)
+                    self._write_progress("downloading", completed, action.rel_path)
                     self._maybe_save_state()
 
     def _maybe_save_state(self) -> None:
@@ -321,6 +329,32 @@ class SyncEngine:
             if self.stats["downloaded"] > 0 and self.stats["downloaded"] % 50 == 0:
                 self.state.save(self.state_path)
                 logger.debug("增量保存状态: %d 个文件", self.stats["downloaded"])
+
+    def _write_progress(self, phase: str, completed: int, current: str = "") -> None:
+        """实时写入同步进度文件（供外部监控）"""
+        import json, time as _time
+        elapsed = _time.monotonic() - self._sync_start
+        total = self._total_actions
+        pct = (completed / total * 100) if total > 0 else 0
+        data = {
+            "status": "syncing",
+            "phase": phase,
+            "current_file": current,
+            "completed": completed,
+            "total": total,
+            "percent": round(pct, 1),
+            "downloaded": self.stats["downloaded"],
+            "uploaded": self.stats["uploaded"],
+            "errors": self.stats["errors"],
+            "elapsed_sec": round(elapsed, 1),
+            "updated_at": _time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        try:
+            tmp = self._progress_file.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.rename(self._progress_file)
+        except Exception:
+            pass  # 进度文件写入失败不影响同步
 
     def _exec_one(self, action: SyncAction) -> None:
         if action.type == "upload":
@@ -409,8 +443,12 @@ class SyncEngine:
         self.stats = {k: 0 for k in self.stats}
         actions: list[SyncAction] = []
 
+        import time as _time
+        self._sync_start = _time.monotonic()
+
         # Phase 1: Scan
         logger.info("开始扫描...")
+        self._write_progress("scanning", 0, "遍历文件夹...")
         try:
             if self.root_folder_id:
                 self._scan_folder(self.root_folder_id, self.local_dir, "", actions)
@@ -434,7 +472,9 @@ class SyncEngine:
 
         if not actions:
             logger.info("无需同步")
+            self._write_progress("idle", 0, "无需同步")
         else:
+            self._total_actions = len(actions)
             # Phase 3: Execute
             self._execute(actions)
 
