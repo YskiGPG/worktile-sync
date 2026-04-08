@@ -28,10 +28,13 @@ sync:
     - ".DS_Store"
     - "Thumbs.db"
     - "*.tmp"
+    - "@eaDir"
+    - "#recycle"
 
 notification:
   enabled: false
   error_threshold: 3
+  notify_on_change: true  # 文件有变更时也推送通知（不只是错误）
   email:
     enabled: false
     smtp_host: "smtp.gmail.com"

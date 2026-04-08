@@ -16,10 +16,13 @@ logger = logging.getLogger(__name__)
 
 INTERNAL_FILES = {
     "sync_state.json", "sync_state.tmp",
-    "sync_health.json", "sync_health.tmp",
     "sync_progress.json", "sync_progress.tmp",
     "sync_audit.csv",
+    # sync_health.json 故意不在此列表 → 允许同步到 Worktile 供远程预览
 }
+
+# 群晖系统目录，始终忽略
+NAS_SYSTEM_DIRS = {"@eaDir", "#recycle", "@tmp"}
 
 
 def _now_iso() -> str:
@@ -64,6 +67,7 @@ class SyncEngine:
         self._progress_file = local_dir / "sync_progress.json"
         self._sync_start = 0.0
         self._total_actions = 0
+        self._recent_changes: list[dict] = []
 
         self.stats: dict[str, int] = {
             "downloaded": 0, "uploaded": 0, "deleted_local": 0,
@@ -72,7 +76,9 @@ class SyncEngine:
         }
 
     def _should_ignore(self, name: str) -> bool:
-        return name in INTERNAL_FILES or should_ignore(name, self.ignore_patterns)
+        return (name in INTERNAL_FILES
+                or name in NAS_SYSTEM_DIRS
+                or should_ignore(name, self.ignore_patterns))
 
     # ── Phase 1: Scan ──────────────────────────────────────────────
 
@@ -372,6 +378,10 @@ class SyncEngine:
             with self._lock:
                 self._record_state(action.rel_path, action.remote, action.local_path)
                 self.stats["downloaded"] += 1
+                self._recent_changes.append({
+                    "action": "download", "direction": "worktile → 本地",
+                    "file": action.rel_path, "size": action.remote.size,
+                })
         except Exception:
             logger.exception("下载失败: %s", action.rel_path)
             with self._lock:
@@ -379,13 +389,14 @@ class SyncEngine:
 
     def _exec_upload(self, action: SyncAction) -> None:
         try:
+            file_size = action.local_path.stat().st_size
             result = self.api.upload_file(action.folder_id, action.local_path)
             data = result.get("data", result)
             remote_info = FileInfo(
                 id=data.get("_id", ""),
                 name=action.local_path.name,
                 is_folder=False,
-                size=action.local_path.stat().st_size,
+                size=file_size,
                 mtime=data.get("updated_at", int(datetime.now().timestamp())),
                 parent_id=action.folder_id,
                 cos_key=data.get("addition", {}).get("path", ""),
@@ -393,6 +404,10 @@ class SyncEngine:
             )
             self._record_state(action.rel_path, remote_info, action.local_path)
             self.stats["uploaded"] += 1
+            self._recent_changes.append({
+                "action": "upload", "direction": "本地 → worktile",
+                "file": action.rel_path, "size": file_size,
+            })
         except Exception:
             logger.exception("上传失败: %s", action.rel_path)
             self.stats["errors"] += 1
@@ -405,6 +420,10 @@ class SyncEngine:
                 action.local_path.unlink()
             self.state.files.pop(action.rel_path, None)
             self.stats["deleted_local"] += 1
+            self._recent_changes.append({
+                "action": "delete_local", "direction": "删除本地",
+                "file": action.rel_path, "size": 0,
+            })
             logger.info("已删除本地: %s", action.rel_path)
         except Exception:
             logger.exception("删除本地失败: %s", action.rel_path)
@@ -415,6 +434,10 @@ class SyncEngine:
             self.api.delete_file(action.remote.id)
             self.state.files.pop(action.rel_path, None)
             self.stats["deleted_remote"] += 1
+            self._recent_changes.append({
+                "action": "delete_remote", "direction": "删除远程",
+                "file": action.rel_path, "size": 0,
+            })
         except Exception:
             logger.exception("删除远程失败: %s", action.rel_path)
             self.stats["errors"] += 1
@@ -445,6 +468,7 @@ class SyncEngine:
 
         import time as _time
         self._sync_start = _time.monotonic()
+        self._recent_changes = []
 
         # Phase 1: Scan
         logger.info("开始扫描...")
@@ -488,7 +512,9 @@ class SyncEngine:
             self.stats["conflicts"], self.stats["errors"],
         )
 
-        return dict(self.stats)
+        result = dict(self.stats)
+        result["recent_changes"] = self._recent_changes[-50:]  # 最近 50 条
+        return result
 
     # ── Helpers ────────────────────────────────────────────────────
 

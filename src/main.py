@@ -158,13 +158,18 @@ def main() -> None:
             stats = engine.sync_once()
             duration = time.monotonic() - start_time
 
-            # 健康状态
+            # 分离 recent_changes（不写入 stats 里）
+            recent_changes = stats.pop("recent_changes", [])
+            has_changes = stats["downloaded"] + stats["uploaded"] + stats["deleted_local"] + stats["deleted_remote"] > 0
+
+            # 健康状态（含最近变更明细）
             health = {
                 "last_sync": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "duration_sec": round(duration, 1),
                 "stats": stats,
                 "status": "error" if stats["errors"] > 0 else "ok",
                 "consecutive_errors": consecutive_errors,
+                "recent_changes": recent_changes,
             }
             _write_health(health_file, health)
 
@@ -191,6 +196,24 @@ def main() -> None:
                         f"同步已恢复正常（此前连续 {consecutive_errors} 轮错误）",
                     )
                 consecutive_errors = 0
+
+            # 文件变更通知（Server酱推送）
+            notify_cfg = config.get("notification", {})
+            if has_changes and notify_cfg.get("notify_on_change"):
+                change_lines = []
+                for c in recent_changes[:20]:
+                    direction = c["direction"]
+                    fname = c["file"].rsplit("/", 1)[-1]
+                    change_lines.append(f"- {direction}: {fname}")
+                body = (
+                    f"下载: {stats['downloaded']} | 上传: {stats['uploaded']} | "
+                    f"删除: {stats['deleted_local'] + stats['deleted_remote']}\n"
+                    f"耗时: {duration:.1f}s\n\n"
+                    + "\n".join(change_lines)
+                )
+                if len(recent_changes) > 20:
+                    body += f"\n...共 {len(recent_changes)} 项变更"
+                notifier.send("Worktile 同步更新", body)
 
             # 等待下一轮（支持中途退出 + 本地文件变化提前触发）
             for _ in range(interval):
