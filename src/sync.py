@@ -14,13 +14,10 @@ from .utils import should_ignore, safe_name, normalize_name, human_size
 
 logger = logging.getLogger(__name__)
 
-# 临时文件不参与同步，正式监控文件允许同步到 Worktile 供远程预览
+# 只排除临时文件（正式监控文件通过"删旧传新"机制同步到 Worktile）
 INTERNAL_FILES = {
-    "sync_state.tmp",
-    "sync_health.tmp",
-    "sync_progress.tmp",
-    # sync_state.json, sync_health.json, sync_progress.json, sync_audit.csv
-    # 故意不在此列表 → 允许同步到 Worktile
+    "sync_state.tmp", "sync_health.tmp", "sync_progress.tmp",
+    "sync_audit.csv.old",
 }
 
 # 群晖系统目录，始终忽略
@@ -240,7 +237,8 @@ class SyncEngine:
                                   local_path=local, folder_id=folder_id,
                                   remote_mtime=remote.mtime)
             elif local_changed:
-                return SyncAction("upload", rel_path, local_path=local,
+                # 传入 remote 信息，上传时先删旧版（Worktile 不覆盖同名文件）
+                return SyncAction("upload", rel_path, remote=remote, local_path=local,
                                   folder_id=folder_id)
 
         return None
@@ -424,6 +422,13 @@ class SyncEngine:
 
     def _exec_upload(self, action: SyncAction) -> None:
         try:
+            # Worktile 上传不覆盖同名文件 → 先删旧版再传新版
+            if action.remote and action.remote.id:
+                try:
+                    self.api.delete_file(action.remote.id)
+                except Exception:
+                    logger.warning("删除旧版本失败（继续上传）: %s", action.rel_path)
+
             file_size = action.local_path.stat().st_size
             result = self.api.upload_file(action.folder_id, action.local_path)
             data = result.get("data", result)

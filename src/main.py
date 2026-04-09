@@ -129,6 +129,9 @@ def main() -> None:
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
 
+    # 启动通知
+    notifier.send("Worktile 同步工具已启动", f"远程: {wt['base_url']}\n本地: {sync_cfg['local_dir']}\n间隔: {interval}s")
+
     # 可选：本地文件监听
     watcher = None
     if sync_cfg.get("watch_local", False):
@@ -141,6 +144,9 @@ def main() -> None:
 
     interval = sync_cfg.get("interval", 60)
     consecutive_errors = 0
+    hourly_stats = {"downloaded": 0, "uploaded": 0, "deleted_local": 0,
+                    "deleted_remote": 0, "errors": 0, "rounds": 0}
+    last_hourly_report = time.time()
 
     try:
         while _running:
@@ -183,7 +189,12 @@ def main() -> None:
             # 审计日志
             _write_audit(audit_file, stats, duration)
 
-            # 错误告警
+            # 累计小时统计
+            for k in ("downloaded", "uploaded", "deleted_local", "deleted_remote", "errors"):
+                hourly_stats[k] = hourly_stats.get(k, 0) + stats.get(k, 0)
+            hourly_stats["rounds"] = hourly_stats.get("rounds", 0) + 1
+
+            # 错误告警（立即发送）
             if stats["errors"] > 0:
                 consecutive_errors += 1
                 if consecutive_errors >= notifier.error_threshold:
@@ -204,23 +215,27 @@ def main() -> None:
                     )
                 consecutive_errors = 0
 
-            # 文件变更通知（Server酱推送）
-            notify_cfg = config.get("notification", {})
-            if has_changes and notify_cfg.get("notify_on_change"):
-                change_lines = []
-                for c in recent_changes[:20]:
-                    direction = c["direction"]
-                    fname = c["file"].rsplit("/", 1)[-1]
-                    change_lines.append(f"- {direction}: {fname}")
+            # 每小时汇总通知
+            now = time.time()
+            if now - last_hourly_report >= 3600:
+                h = hourly_stats
+                total_changes = h["downloaded"] + h["uploaded"] + h["deleted_local"] + h["deleted_remote"]
                 body = (
-                    f"下载: {stats['downloaded']} | 上传: {stats['uploaded']} | "
-                    f"删除: {stats['deleted_local'] + stats['deleted_remote']}\n"
-                    f"耗时: {duration:.1f}s\n\n"
-                    + "\n".join(change_lines)
+                    f"过去 1 小时同步汇总 ({h['rounds']} 轮)\n\n"
+                    f"下载: {h['downloaded']} | 上传: {h['uploaded']} | "
+                    f"删除: {h['deleted_local'] + h['deleted_remote']} | "
+                    f"错误: {h['errors']}\n"
+                    f"状态: {'正常' if h['errors'] == 0 else '有错误'}"
                 )
-                if len(recent_changes) > 20:
-                    body += f"\n...共 {len(recent_changes)} 项变更"
-                notifier.send("Worktile 同步更新", body)
+                if total_changes > 0 and recent_changes:
+                    body += "\n\n最近变更:"
+                    for c in recent_changes[:10]:
+                        body += f"\n- {c['direction']}: {c['file'].rsplit('/', 1)[-1]}"
+                notifier.send("Worktile 同步小时报", body)
+                # 重置小时统计
+                hourly_stats = {"downloaded": 0, "uploaded": 0, "deleted_local": 0,
+                                "deleted_remote": 0, "errors": 0, "rounds": 0}
+                last_hourly_report = now
 
             # 等待下一轮（支持中途退出 + 本地文件变化提前触发）
             for _ in range(interval):
@@ -235,6 +250,7 @@ def main() -> None:
         if watcher:
             watcher.stop()
         api.close()
+        notifier.send("Worktile 同步工具已停止", "容器已关闭")
         logger.info("同步工具已停止")
 
 
