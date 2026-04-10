@@ -14,10 +14,15 @@ from .utils import should_ignore, safe_name, normalize_name, human_size, file_md
 
 logger = logging.getLogger(__name__)
 
-# 只排除临时文件（正式监控文件通过"删旧传新"机制同步到 Worktile）
+# 只排除临时文件
 INTERNAL_FILES = {
     "sync_state.tmp", "sync_health.tmp", "sync_progress.tmp",
     "sync_audit.csv.old",
+}
+
+# 监控文件：同步到 Worktile 但用删旧传新（不创版本），且跳过冲突检测
+MONITORING_FILES = {
+    "sync_health.json", "sync_state.json", "sync_progress.json", "sync_audit.csv",
 }
 
 # 群晖系统目录，始终忽略
@@ -80,6 +85,7 @@ class SyncEngine:
         return (name in INTERNAL_FILES
                 or name in NAS_SYSTEM_DIRS
                 or name.endswith(".downloading")
+                or ".conflict" in name and any(name.startswith(m.split(".")[0]) for m in MONITORING_FILES)
                 or should_ignore(name, self.ignore_patterns))
 
     # ── Phase 1: Scan ──────────────────────────────────────────────
@@ -234,16 +240,26 @@ class SyncEngine:
                     else:
                         local_changed = True
 
+            # 监控文件：跳过冲突检测，本地始终覆盖远程
+            is_monitoring = name in MONITORING_FILES
+
             if not prev:
                 # 首次同步：大小一致视为已同步
                 if remote.size == local_size:
                     self._record_state(rel_path, remote, local)
                     return None
-                # 大小不同，以远程为准
+                # 大小不同，以远程为准（监控文件以本地为准）
+                if is_monitoring:
+                    return SyncAction("upload", rel_path, remote=remote, local_path=local,
+                                      folder_id=folder_id)
                 return SyncAction("download", rel_path, remote=remote,
                                   local_path=local, folder_id=folder_id,
                                   remote_mtime=remote.mtime)
             elif remote_changed and local_changed:
+                if is_monitoring:
+                    # 监控文件冲突 → 本地覆盖远程，不备份
+                    return SyncAction("upload", rel_path, remote=remote, local_path=local,
+                                      folder_id=folder_id)
                 return SyncAction("conflict", rel_path, remote=remote,
                                   local_path=local, folder_id=folder_id,
                                   remote_mtime=remote.mtime)
@@ -472,9 +488,19 @@ class SyncEngine:
         try:
             file_size = action.local_path.stat().st_size
 
-            # 远程已有旧版 → 上传新版本（保留历史）；否则新建上传
+            is_monitoring = action.local_path.name in MONITORING_FILES
+
             if action.remote and action.remote.id:
-                result = self.api.update_file(action.remote.id, action.local_path)
+                if is_monitoring:
+                    # 监控文件：删旧传新（不创版本历史）
+                    try:
+                        self.api.delete_file(action.remote.id)
+                    except Exception:
+                        logger.warning("删除旧监控文件失败: %s", action.rel_path)
+                    result = self.api.upload_file(action.folder_id, action.local_path)
+                else:
+                    # 业务文件：版本更新（保留历史）
+                    result = self.api.update_file(action.remote.id, action.local_path)
             else:
                 result = self.api.upload_file(action.folder_id, action.local_path)
             data = result.get("data", result)
