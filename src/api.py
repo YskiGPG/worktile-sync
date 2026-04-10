@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import mimetypes
+
 import httpx
 
 from .auth import AuthManager
@@ -227,8 +229,14 @@ class WorktileAPI:
 
         raise WorktileAPIError(f"下载失败: {last_exc}") from last_exc
 
+    @staticmethod
+    def _guess_mime(path: Path) -> str:
+        mime, _ = mimetypes.guess_type(path.name)
+        return mime or "application/octet-stream"
+
     def upload_file(self, folder_id: str, file_path: Path) -> dict[str, Any]:
         """上传新文件到指定文件夹"""
+        mime = self._guess_mime(file_path)
         with open(file_path, "rb") as f:
             resp = self._request(
                 "POST",
@@ -240,7 +248,7 @@ class WorktileAPI:
                     "team_id": self.team_id,
                 },
                 data={"title": file_path.name},
-                files={"file": (file_path.name, f)},
+                files={"file": (file_path.name, f, mime)},
             )
 
         result = resp.json()
@@ -252,6 +260,7 @@ class WorktileAPI:
 
         POST https://wt-box.worktile.com/drive/update?team_id={team_id}&id={file_id}
         """
+        mime = self._guess_mime(file_path)
         with open(file_path, "rb") as f:
             resp = self._request(
                 "POST",
@@ -262,7 +271,7 @@ class WorktileAPI:
                     "id": file_id,
                 },
                 data={"title": file_path.name},
-                files={"file": (file_path.name, f)},
+                files={"file": (file_path.name, f, mime)},
             )
 
         result = resp.json()
