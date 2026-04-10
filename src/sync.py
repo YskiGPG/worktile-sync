@@ -79,6 +79,7 @@ class SyncEngine:
     def _should_ignore(self, name: str) -> bool:
         return (name in INTERNAL_FILES
                 or name in NAS_SYSTEM_DIRS
+                or name.endswith(".downloading")
                 or should_ignore(name, self.ignore_patterns))
 
     # ── Phase 1: Scan ──────────────────────────────────────────────
@@ -312,6 +313,8 @@ class SyncEngine:
             # 找到了！remote_id 一样但路径不同 → Worktile 端重命名
             old_local = self.local_dir / old_path
             new_local = action.local_path
+            if not new_local:
+                continue
 
             if old_local.exists():
                 logger.info("检测到远程重命名: %s → %s (跳过重新下载)", old_path, action.rel_path)
