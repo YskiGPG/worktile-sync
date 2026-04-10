@@ -129,6 +129,8 @@ def main() -> None:
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
 
+    interval = sync_cfg.get("interval", 60)
+
     # 启动通知
     notifier.send("Worktile 同步工具已启动", f"远程: {wt['base_url']}\n本地: {sync_cfg['local_dir']}\n间隔: {interval}s")
 
@@ -141,8 +143,6 @@ def main() -> None:
             watcher.start()
         except ImportError:
             logger.warning("watchdog 未安装，本地文件监听禁用。pip install watchdog 可启用")
-
-    interval = sync_cfg.get("interval", 60)
     consecutive_errors = 0
     hourly_stats = {"downloaded": 0, "uploaded": 0, "deleted_local": 0,
                     "deleted_remote": 0, "errors": 0, "rounds": 0}
