@@ -228,6 +228,7 @@ class WorktileAPI:
         raise WorktileAPIError(f"下载失败: {last_exc}") from last_exc
 
     def upload_file(self, folder_id: str, file_path: Path) -> dict[str, Any]:
+        """上传新文件到指定文件夹"""
         with open(file_path, "rb") as f:
             resp = self._request(
                 "POST",
@@ -244,6 +245,29 @@ class WorktileAPI:
 
         result = resp.json()
         logger.info("已上传: %s", file_path.name)
+        return result
+
+    def update_file(self, file_id: str, file_path: Path) -> dict[str, Any]:
+        """上传新版本（保留文件 ID 和版本历史）
+
+        POST https://wt-box.worktile.com/drive/update?team_id={team_id}&id={file_id}
+        """
+        with open(file_path, "rb") as f:
+            resp = self._request(
+                "POST",
+                "/drive/update",
+                use_box=True,
+                params={
+                    "team_id": self.team_id,
+                    "id": file_id,
+                },
+                data={"title": file_path.name},
+                files={"file": (file_path.name, f)},
+            )
+
+        result = resp.json()
+        version = result.get("data", {}).get("addition", {}).get("current_version", "?")
+        logger.info("已更新版本: %s (v%s)", file_path.name, version)
         return result
 
     def delete_file(self, file_id: str) -> None:

@@ -467,15 +467,13 @@ class SyncEngine:
 
     def _exec_upload(self, action: SyncAction) -> None:
         try:
-            # Worktile 上传不覆盖同名文件 → 先删旧版再传新版
-            if action.remote and action.remote.id:
-                try:
-                    self.api.delete_file(action.remote.id)
-                except Exception:
-                    logger.warning("删除旧版本失败（继续上传）: %s", action.rel_path)
-
             file_size = action.local_path.stat().st_size
-            result = self.api.upload_file(action.folder_id, action.local_path)
+
+            # 远程已有旧版 → 上传新版本（保留历史）；否则新建上传
+            if action.remote and action.remote.id:
+                result = self.api.update_file(action.remote.id, action.local_path)
+            else:
+                result = self.api.upload_file(action.folder_id, action.local_path)
             data = result.get("data", result)
             remote_info = FileInfo(
                 id=data.get("_id", ""),
