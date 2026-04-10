@@ -1199,14 +1199,46 @@ for _ in range(interval):
 
 Docker 环境中 inotify 对 volume mount 的支持取决于存储驱动，不保证所有环境都能用。设为可选功能（`watch_local: true`）。
 
+## 15.5 已知限制
+
+### API 上传的文件在 Worktile 网页端无法预览/下载
+
+通过 `/drive/upload` API 上传的文件缺少 `current_version` 元数据。Worktile 网页端在预览/下载时构造 URL `version=${addition.current_version}`，对于 API 上传的文件这个值是 `undefined`，导致 400 错误：
+
+```
+GET /drives/{id}/from-s3?version=undefined&action=download
+→ {"code":400,"message":"Reject by legacy middleware.","err":{"code":12002}}
+```
+
+这是 Worktile 后端对 API 上传和网页上传的处理不一致导致的。**无法从客户端侧修复。**
+
+影响：监控文件（health/progress/state/audit）无法同步到 Worktile 预览。改为仅在 NAS 本地通过 File Station 查看。
+
+### WebSocket 实时推送（已发现，待实现）
+
+从浏览器 DevTools 中发现 Worktile 使用 Socket.IO WebSocket 连接进行实时通知：
+
+```
+wss://zrhubei.worktile.com/socket.io/?token={auth_token}&...
+```
+
+参数：
+- `token`: 认证令牌（非 Cookie，可能从登录接口获取）
+- 协议: Socket.IO (基于 WebSocket)
+
+如果能逆向这个连接，可以实现：
+- **云端 → 本地秒级同步**（替代 20 秒轮询）
+- 减少 API 调用量（不用定期扫描所有文件夹）
+- 更低的 CPU 和网络开销
+
 ## 16. 未来改进方向
 
+- [ ] **WebSocket 实时推送**：逆向 Socket.IO 连接，实现云端变更秒级同步
 - [ ] **Cookie 自动刷新**：通过无头浏览器自动登录
 - [ ] **Web 管理界面**：展示状态、手动触发、更新 Cookie
 - [ ] **并发上传**：类似下载的队列模式
 - [ ] **多团队支持**：同时同步多个 Worktile 团队
 - [ ] **选择性同步**：通过 UI 选择要同步的文件夹
-- [ ] **版本历史**：利用 Worktile 的版本机制保留历史
 
 ---
 

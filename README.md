@@ -166,7 +166,7 @@ python -m src.main
 
 ## 监控文件
 
-同步目录下会自动生成以下监控文件，**全部同步到 Worktile** 可直接在网页端预览：
+同步目录下会自动生成以下监控文件，通过 NAS File Station 查看（不同步到 Worktile）：
 
 | 文件 | 说明 | 更新频率 |
 |------|------|---------|
@@ -265,5 +265,6 @@ python -m src.main
 - **NAS 存储空间**：首次同步会下载全部文件，确保 NAS 有足够空间
 - **超长文件名**：中文文件名超过 85 个字符（255 字节）会自动截断并加 hash 后缀
 - **群晖系统目录**：`@eaDir`、`#recycle` 等群晖系统目录自动忽略
-- **监控文件**：`sync_health.json`、`sync_progress.json`、`sync_state.json`、`sync_audit.csv` 全部同步到 Worktile，可在网页端直接预览
-- **变更通知**：`notify_on_change: true` 时，文件有变更会推送 Server酱/邮件通知；连续错误自动告警
+- **监控文件**：`sync_health.json`、`sync_progress.json`、`sync_state.json`、`sync_audit.csv` 仅存在 NAS 本地（通过 File Station 查看）。不同步到 Worktile，因为 API 上传的文件缺少 `version` 元数据，在 Worktile 网页端无法预览/下载
+- **变更通知**：报错立即推送 + 每小时汇总；容器启动/停止通知
+- **版本历史**：业务文件更新时使用 `/drive/update` API，保留 Worktile 上的版本历史

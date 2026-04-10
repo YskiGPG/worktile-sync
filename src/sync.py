@@ -14,13 +14,15 @@ from .utils import should_ignore, safe_name, normalize_name, human_size, file_md
 
 logger = logging.getLogger(__name__)
 
-# 只排除临时文件
+# 监控文件不同步到 Worktile（API 上传的文件缺少 version 元数据，无法预览/下载）
 INTERNAL_FILES = {
-    "sync_state.tmp", "sync_health.tmp", "sync_progress.tmp",
-    "sync_audit.csv.old",
+    "sync_state.json", "sync_state.tmp",
+    "sync_health.json", "sync_health.tmp",
+    "sync_progress.json", "sync_progress.tmp",
+    "sync_audit.csv", "sync_audit.csv.old",
 }
 
-# 监控文件：同步到 Worktile 但用删旧传新（不创版本），且跳过冲突检测
+# 监控文件名集合（用于特殊处理逻辑）
 MONITORING_FILES = {
     "sync_health.json", "sync_state.json", "sync_progress.json", "sync_audit.csv",
 }
