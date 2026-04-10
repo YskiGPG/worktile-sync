@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .api import WorktileAPI, FileInfo
 from .state import SyncState, FileRecord, FolderRecord
-from .utils import should_ignore, safe_name, normalize_name, human_size
+from .utils import should_ignore, safe_name, normalize_name, human_size, file_md5
 
 logger = logging.getLogger(__name__)
 
@@ -215,9 +215,23 @@ class SyncEngine:
             remote_changed = prev and (
                 remote.mtime != prev.remote_mtime or remote.size != prev.remote_size
             )
-            local_changed = prev and (
-                abs(local_ts - prev.local_mtime) > 1 or local_size != prev.local_size
-            )
+
+            # 本地变化检测：时间变了 + 大小也变了 → 确定变了
+            # 时间变了但大小没变 → 算 hash 确认内容是否真的变了
+            local_changed = False
+            if prev:
+                mtime_diff = abs(local_ts - prev.local_mtime) > 1
+                size_diff = local_size != prev.local_size
+                if size_diff:
+                    local_changed = True
+                elif mtime_diff and not size_diff:
+                    # 时间变了但大小没变 → hash 校验
+                    current_hash = file_md5(local)
+                    if prev.local_hash and current_hash == prev.local_hash:
+                        local_changed = False  # 内容没变（只是 touch 了）
+                        logger.debug("mtime 变化但 hash 一致，跳过: %s", rel_path)
+                    else:
+                        local_changed = True
 
             if not prev:
                 # 首次同步：大小一致视为已同步
@@ -270,23 +284,54 @@ class SyncEngine:
         # 按更新时间排序（最近更新的优先）
         actions.sort(key=lambda a: -a.remote_mtime)
 
-        # 重命名检测
-        self._detect_renames(actions)
+        # 重命名检测（通过 remote_id 匹配）
+        self._handle_renames(actions)
 
-    def _detect_renames(self, actions: list[SyncAction]) -> None:
-        """检测可能的重命名（仅日志，Worktile 无 rename API）"""
-        del_remotes = {a.rel_path: a for a in actions
-                       if a.type == "delete_remote" and a.remote}
-        uploads = {a.rel_path: a for a in actions
-                   if a.type == "upload" and a.local_path and a.local_path.exists()}
+    def _handle_renames(self, actions: list[SyncAction]) -> None:
+        """通过 remote_id 检测重命名，用本地 rename 替代 download+delete
 
-        for del_path, del_a in del_remotes.items():
-            del_size = del_a.remote.size
-            for up_path, up_a in uploads.items():
-                if up_a.local_path.stat().st_size == del_size and del_path != up_path:
-                    logger.info("检测到可能的重命名: %s → %s (大小: %s)",
-                                del_path, up_path, human_size(del_size))
-                    break
+        Worktile 上重命名文件 → _id 不变，title 变
+        → 旧路径消失(download new)，state 中旧路径的 remote_id 与新路径匹配
+        → 直接本地 rename，避免重新下载
+        """
+        # remote_id → 旧路径 映射（从 state 中获取）
+        id_to_old_path: dict[str, str] = {}
+        for path, rec in self.state.files.items():
+            if rec.remote_id:
+                id_to_old_path[rec.remote_id] = path
+
+        # 找出 download 动作中 remote_id 已在 state 中的（说明是重命名）
+        to_remove: list[SyncAction] = []
+        for action in actions:
+            if action.type != "download" or not action.remote:
+                continue
+            old_path = id_to_old_path.get(action.remote.id)
+            if not old_path or old_path == action.rel_path:
+                continue
+
+            # 找到了！remote_id 一样但路径不同 → Worktile 端重命名
+            old_local = self.local_dir / old_path
+            new_local = action.local_path
+
+            if old_local.exists():
+                logger.info("检测到远程重命名: %s → %s (跳过重新下载)", old_path, action.rel_path)
+                try:
+                    new_local.parent.mkdir(parents=True, exist_ok=True)
+                    old_local.rename(new_local)
+                    # 更新 state
+                    self.state.files.pop(old_path, None)
+                    self._record_state(action.rel_path, action.remote, new_local)
+                    to_remove.append(action)
+                    # 同时移除旧路径的 delete/upload 动作
+                    for other in actions:
+                        if other.rel_path == old_path:
+                            to_remove.append(other)
+                except Exception:
+                    logger.exception("本地重命名失败: %s → %s", old_path, action.rel_path)
+
+        for a in to_remove:
+            if a in actions:
+                actions.remove(a)
 
     # ── Phase 3: Execute ───────────────────────────────────────────
 
@@ -573,6 +618,13 @@ class SyncEngine:
 
     def _record_state(self, rel_path: str, remote: FileInfo, local_path: Path) -> None:
         stat = local_path.stat() if local_path.exists() else None
+        # 小文件（<50MB）存 hash，大文件跳过（算 hash 太慢）
+        local_hash = ""
+        if stat and stat.st_size < 50 * 1024 * 1024:
+            try:
+                local_hash = file_md5(local_path)
+            except Exception:
+                pass
         self.state.files[rel_path] = FileRecord(
             name=remote.name,
             remote_id=remote.id,
@@ -581,4 +633,5 @@ class SyncEngine:
             local_mtime=stat.st_mtime if stat else 0.0,
             local_size=stat.st_size if stat else 0,
             last_sync=_now_iso(),
+            local_hash=local_hash,
         )

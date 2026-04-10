@@ -20,6 +20,7 @@ class FileRecord:
     local_size: int
     last_sync: str
     cos_key: str = ""
+    local_hash: str = ""  # MD5 hash（懒计算，仅 mtime 变但 size 不变时触发）
 
 
 @dataclass
