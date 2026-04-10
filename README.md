@@ -233,14 +233,16 @@ python -m src.main
 |------|------|------|
 | 根文件夹列表 | GET | `/api/drives/folders?parent_id=&belong=2` |
 | 文件/子文件夹列表 | GET | `/api/drives/list?parent_id={id}&belong=2&pi=0&ps=200` |
-| 下载文件 | GET | `wt-box.worktile.com/drives/{file_id}?team_id={id}&version={ver}&action=download` |
-| 上传文件 | POST | `wt-box.worktile.com/drive/upload?belong=2&parent_id={id}&team_id={id}` |
+| 下载文件 | GET | `wt-box/drives/{file_id}?team_id={id}&version={ver}&action=download` |
+| 上传新文件 | POST | `wt-box/drive/upload?belong=2&parent_id={id}&team_id={id}` |
+| 上传新版本 | POST | `wt-box/drive/update?team_id={id}&id={file_id}` |
 | 创建文件夹 | POST | `/api/drive/folder` |
 | 删除文件 | DELETE | `/api/drives/{file_id}` |
 
 - 主域名接口使用标准 `Cookie` Header
 - wt-box 跨域接口使用自定义 `x-cookies` Header
-- 详细接口文档见 [CLAUDE.md](CLAUDE.md) 和 [DOWNLOAD_INVESTIGATION.md](DOWNLOAD_INVESTIGATION.md)
+- 上传新文件（`/drive/upload`）创建新条目；更新已有文件（`/drive/update`）保留文件 ID 和版本历史
+- 详细接口文档见 [CLAUDE.md](CLAUDE.md) 和 [TECHNICAL_DEEP_DIVE.md](TECHNICAL_DEEP_DIVE.md)
 
 ## 升级容器
 

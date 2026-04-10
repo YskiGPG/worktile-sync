@@ -239,16 +239,40 @@ deleteDrive: function(id) {
 
 软删除（移到回收站）。还有 `removeAll` 和 `/real` 端点用于批量删除和彻底删除。
 
-### 已确认的 6 个接口汇总
+### 已确认的 7 个接口汇总
 
 | 功能 | 方法 | 端点 | 域名 | 认证 |
 |------|------|------|------|------|
 | 根文件夹列表 | GET | `/api/drives/folders` | 主域名 | Cookie |
 | 文件列表（分页） | GET | `/api/drives/list` | 主域名 | Cookie |
 | 下载文件 | GET | `/drives/{id}` | wt-box | x-cookies |
-| 上传文件 | POST | `/drive/upload` | wt-box | x-cookies |
+| 上传新文件 | POST | `/drive/upload` | wt-box | x-cookies |
+| 上传新版本 | POST | `/drive/update?id={file_id}` | wt-box | x-cookies |
 | 创建文件夹 | POST | `/api/drive/folder` | 主域名 | Cookie |
 | 删除文件 | DELETE | `/api/drives/{id}` | 主域名 | Cookie |
+
+### 3.6 版本上传接口（浏览器抓包）
+
+在 Worktile 网页版点击文件 → "上传新版本" 时抓到的请求：
+
+```
+POST https://wt-box.worktile.com/drive/update?team_id={team_id}&id={file_id}
+Headers: x-cookies: <cookie>
+Content-Type: multipart/form-data
+Form: title=文件名, file=二进制
+```
+
+与上传新文件（`/drive/upload`）的区别：
+
+| | 新文件上传 | 版本更新 |
+|--|---------|---------|
+| 端点 | `/drive/upload` | `/drive/update` |
+| 参数 | `parent_id` + `belong` | `id`（文件 _id） |
+| 效果 | 创建新文件条目 | 更新已有文件，版本号 +1 |
+| 文件 ID | 生成新 `_id` | 保持原 `_id` 不变 |
+| 版本历史 | 无 | 可查看所有历史版本 |
+
+发现方式：用户在 Worktile 网页版执行"上传新版本"操作，通过 Chrome DevTools Network 面板抓包。
 
 ---
 
@@ -873,6 +897,54 @@ docker buildx build --platform linux/amd64 -t worktile-sync:v3 --load .
 | `/data/worktile-sync` | 同步目录 + 状态文件 | `worktile同步文件/` |
 
 只需要两个映射。状态文件和健康文件自动写入同步目录。
+
+---
+
+## 11.5 v4 补充特性
+
+### Hash 校验（内容变化精确检测）
+
+检测流程：
+```
+文件名匹配 → mtime 对比 → size 对比 → hash 对比
+
+mtime 变了？
+├── size 也变了 → 确定变了（不算 hash）
+└── size 没变 → 算 MD5
+    ├── hash 一致 → 没真的变（只是 touch/访问）→ 跳过
+    └── hash 不同 → 确实变了 → 同步
+```
+
+- 小文件（<50MB）同步时自动存 hash 到 state
+- 大文件跳过 hash 计算（太慢），靠 mtime+size 判断
+- 仅在"mtime 变但 size 不变"这一罕见场景触发 hash 计算
+
+### 重命名检测（基于 remote_id）
+
+Worktile 上重命名文件不会改变文件的 `_id`。利用这一点：
+
+```
+state 中记录: "合同A.pdf" → remote_id: "abc123"
+Worktile 上改名为 "合同B.pdf"
+扫描发现: "合同B.pdf"(remote_id: "abc123") 在 state 里对应 "合同A.pdf"
+→ 本地直接 rename，不重新下载
+→ 节省传输
+```
+
+实现：在 Plan 阶段，遍历所有 download 动作，用 `remote_id` 匹配 state 中的旧路径。匹配成功则替换为本地 rename 操作。
+
+### 版本上传（保留历史）
+
+更新已有文件时，调用 `/drive/update` 而非"删旧+传新"：
+
+```python
+if action.remote and action.remote.id:
+    api.update_file(file_id, local_path)   # 版本 +1，ID 不变
+else:
+    api.upload_file(folder_id, local_path)  # 新建文件
+```
+
+好处：文件 ID 稳定、版本历史可追溯、单次 API 调用。
 
 ---
 
