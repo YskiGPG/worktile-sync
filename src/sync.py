@@ -14,12 +14,10 @@ from .utils import should_ignore, safe_name, normalize_name, human_size, file_md
 
 logger = logging.getLogger(__name__)
 
-# 监控文件不同步到 Worktile（API 上传的文件缺少 version 元数据，无法预览/下载）
+# 内部临时文件不同步（临时写入文件 + 轮转备份）
 INTERNAL_FILES = {
-    "sync_state.json", "sync_state.tmp",
-    "sync_health.json", "sync_health.tmp",
-    "sync_progress.json", "sync_progress.tmp",
-    "sync_audit.csv", "sync_audit.csv.old",
+    "sync_state.tmp", "sync_health.tmp", "sync_progress.tmp",
+    "sync_audit.csv.old",
 }
 
 # 监控文件名集合（用于特殊处理逻辑）
@@ -92,6 +90,83 @@ class SyncEngine:
 
     # ── Phase 1: Scan ──────────────────────────────────────────────
 
+    def _check_local_changes(
+        self,
+        folder_id: str,
+        local_path: Path,
+        rel_prefix: str,
+        actions: list[SyncAction],
+    ) -> None:
+        """远程未变化时，仅检查本地是否有新增/修改的文件（不调用 API）"""
+        if not local_path.exists():
+            return
+
+        for entry in local_path.iterdir():
+            if self._should_ignore(entry.name):
+                continue
+
+            name = normalize_name(entry.name)
+            local_name = safe_name(name)
+            rel_path = f"{rel_prefix}/{local_name}" if rel_prefix else local_name
+
+            if entry.is_dir():
+                sub_folder = self.state.folders.get(rel_path)
+                if sub_folder:
+                    # 已知子文件夹，递归检查本地变化
+                    self._check_local_changes(sub_folder.remote_id, entry, rel_path, actions)
+                else:
+                    # 全新本地文件夹 → 在远程创建并执行完整扫描
+                    new_id = self._create_remote_folder(folder_id, name)
+                    if new_id:
+                        try:
+                            self._scan_folder(new_id, entry, rel_path, actions)
+                        except Exception:
+                            logger.exception("扫描新建远程文件夹失败: %s", rel_path)
+                            self.stats["errors"] += 1
+                continue
+
+            if not entry.is_file():
+                continue
+
+            prev = self.state.files.get(rel_path)
+            if not prev:
+                # 新本地文件 → 上传
+                actions.append(SyncAction("upload", rel_path, local_path=entry,
+                                          folder_id=folder_id))
+                continue
+
+            # 已知文件 → 检查本地是否修改
+            local_ts = entry.stat().st_mtime
+            local_size = entry.stat().st_size
+            local_changed = False
+
+            size_diff = local_size != prev.local_size
+            mtime_diff = abs(local_ts - prev.local_mtime) > 1
+
+            if size_diff:
+                local_changed = True
+            elif mtime_diff:
+                current_hash = file_md5(entry)
+                if prev.local_hash and current_hash == prev.local_hash:
+                    logger.debug("mtime 变化但 hash 一致，跳过: %s", rel_path)
+                else:
+                    local_changed = True
+
+            if local_changed:
+                # 从 state 构造 remote 信息用于版本更新
+                remote_info = FileInfo(
+                    id=prev.remote_id,
+                    name=name,
+                    is_folder=False,
+                    size=prev.remote_size,
+                    mtime=prev.remote_mtime,
+                    parent_id=folder_id,
+                    cos_key=prev.cos_key,
+                    version=0,
+                )
+                actions.append(SyncAction("upload", rel_path, remote=remote_info,
+                                          local_path=entry, folder_id=folder_id))
+
     def _scan_folder(
         self,
         folder_id: str,
@@ -104,11 +179,12 @@ class SyncEngine:
         folder_key = rel_prefix or "/"
         prev_folder = self.state.folders.get(folder_key)
 
-        # 文件夹 updated_at 跳过：未变化则跳过整个子树
+        # 文件夹 updated_at 跳过：远程未变化时跳过 API 调用，但仍检查本地变化
         if prev_folder and folder_mtime > 0 and folder_mtime == prev_folder.remote_mtime:
+            self._check_local_changes(folder_id, local_path, rel_prefix, actions)
             self.stats["skipped_folders"] += 1
             self._folders_skipped += 1
-            logger.debug("文件夹未变化，跳过: %s", rel_prefix or "/")
+            logger.debug("远程未变化，跳过远程扫描（已检查本地变化）: %s", rel_prefix or "/")
             return
 
         local_path.mkdir(parents=True, exist_ok=True)

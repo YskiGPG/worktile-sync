@@ -1123,11 +1123,18 @@ FolderRecord(remote_id="xxx", remote_mtime=1775574801, ...)
 
 # 下一轮同步时，比较 API 返回的 mtime 与记录的 mtime
 if folder_mtime == prev_folder.remote_mtime:
-    # 文件夹内容未变化，跳过整个子树（不调 list_files API）
+    # 远程未变化 → 跳过 API 调用，但仍检查本地变化
+    _check_local_changes(folder_id, local_path, ...)  # 不调 API，只扫本地
     return
 ```
 
-效果：500 个文件夹 → 只扫描有变化的几个 → API 调用从 500+ 降到 ~10。
+**v4 修复**：早期版本直接 `return` 跳过整个子树，导致本地新增/修改的文件无法被检测到上传。
+修复后，远程未变化时仍会扫描本地文件系统：
+- 新本地文件 → 创建 upload 动作
+- 已知文件本地修改 → 通过 mtime/size/hash 检测 → 创建 upload 动作
+- 新本地文件夹 → 远程创建文件夹并递归完整扫描
+
+效果：500 个文件夹 → 只扫描有变化的几个 → API 调用从 500+ 降到 ~10，同时本地变化不会丢失。
 
 ### 临时文件 + 大小校验
 
