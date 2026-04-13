@@ -14,10 +14,12 @@ from .utils import should_ignore, safe_name, normalize_name, human_size, file_md
 
 logger = logging.getLogger(__name__)
 
-# 内部临时文件不同步（临时写入文件 + 轮转备份）
+# 内部文件不同步到 Worktile（监控文件 + 临时文件）
 INTERNAL_FILES = {
-    "sync_state.tmp", "sync_health.tmp", "sync_progress.tmp",
-    "sync_audit.csv.old",
+    "sync_state.json", "sync_state.tmp",
+    "sync_health.json", "sync_health.tmp",
+    "sync_progress.json", "sync_progress.tmp",
+    "sync_audit.csv", "sync_audit.csv.old",
 }
 
 # 监控文件名集合（用于特殊处理逻辑）
@@ -346,7 +348,6 @@ class SyncEngine:
                                   local_path=local, folder_id=folder_id,
                                   remote_mtime=remote.mtime)
             elif local_changed:
-                # 传入 remote 信息，上传时先删旧版（Worktile 不覆盖同名文件）
                 return SyncAction("upload", rel_path, remote=remote, local_path=local,
                                   folder_id=folder_id)
 
@@ -569,16 +570,8 @@ class SyncEngine:
             is_monitoring = action.local_path.name in MONITORING_FILES
 
             if action.remote and action.remote.id:
-                if is_monitoring:
-                    # 监控文件：删旧传新（不创版本历史）
-                    try:
-                        self.api.delete_file(action.remote.id)
-                    except Exception:
-                        logger.warning("删除旧监控文件失败: %s", action.rel_path)
-                    result = self.api.upload_file(action.folder_id, action.local_path)
-                else:
-                    # 业务文件：版本更新（保留历史）
-                    result = self.api.update_file(action.remote.id, action.local_path)
+                # 版本更新（保留历史 + 可预览）
+                result = self.api.update_file(action.remote.id, action.local_path)
             else:
                 result = self.api.upload_file(action.folder_id, action.local_path)
             data = result.get("data", result)

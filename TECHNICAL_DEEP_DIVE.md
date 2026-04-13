@@ -17,6 +17,7 @@
 9. [状态持久化与原子写入](#9-状态持久化与原子写入)
 10. [监控与告警](#10-监控与告警)
 11. [Docker 部署与群晖 NAS](#11-docker-部署与群晖-nas)
+11.5. [v4 补充特性](#115-v4-补充特性)
 12. [踩过的坑与解决方案](#12-踩过的坑与解决方案)
 13. [设计决策与权衡](#13-设计决策与权衡)
 14. [测试策略](#14-测试策略)
@@ -64,10 +65,11 @@ Worktile 网盘（云端）
 ```
 src/
 ├── main.py      # 入口：配置加载、主循环、告警
-├── api.py       # HTTP 客户端：6 个 Worktile API 的封装
+├── api.py       # HTTP 客户端：7 个 Worktile API 的封装
 ├── auth.py      # 认证：Cookie 管理、跨域 Header
 ├── sync.py      # 核心：双向同步引擎
 ├── state.py     # 持久化：JSON 状态文件
+├── status.py    # HTTP 状态面板（轻量 HTTP 服务器）
 ├── notify.py    # 通知：邮件 + Webhook
 └── utils.py     # 工具：日志、文件名截断、哈希
 ```
@@ -92,6 +94,11 @@ main.py (循环后)
   ├─> 写入 sync_health.json
   ├─> 检查连续错误 → notifier.send()
   └─> sleep(interval)
+
+StatusServer (守护线程, 端口 9090)
+  └─> 读取 sync_health.json / sync_progress.json / sync_audit.csv / sync.log
+  └─> 提供 HTTP API: /health /status /progress /audit /log
+  └─> 提供 HTML 仪表盘: / (10 秒自动刷新)
 ```
 
 ### 依赖
@@ -750,15 +757,19 @@ else:
 | v1 | `/app/sync_state.json`（容器内） | 容器删除重建后丢失 |
 | v3 | `/data/worktile-sync/sync_state.json`（同步目录） | 随 Volume 持久化 |
 
-### 监控文件同步到 Worktile
+### 监控文件不同步到 Worktile (INTERNAL_FILES)
 
-v4 的设计选择：监控文件（health/progress/state/audit）**允许同步到 Worktile**，这样用户可以在 Worktile 网页端直接预览同步状态，无需登录 NAS。
+v4 的设计选择：监控文件（health/progress/state/audit）**不同步到 Worktile**，加入 `INTERNAL_FILES` 排除列表。原因：
 
-只有 `.tmp` 临时文件被忽略（防止写到一半的文件被同步）：
+1. **无法预览**：通过 `/drive/upload` API 上传的文件缺少 `current_version` 元数据，Worktile 网页端构造下载 URL 时 `version=undefined`，返回 400 错误（详见 15.5 节）
+2. **不应可见**：这些是运维监控文件，员工不需要也不应该在 Worktile 网盘中看到
 
 ```python
-# 只排除临时文件
-INTERNAL_FILES = {"sync_state.tmp", "sync_health.tmp", "sync_progress.tmp"}
+# 监控文件 + 临时文件均排除同步
+INTERNAL_FILES = {
+    "sync_state.json", "sync_health.json", "sync_progress.json", "sync_audit.csv",
+    "sync_state.tmp", "sync_health.tmp", "sync_progress.tmp",
+}
 
 # 群晖系统目录始终忽略
 NAS_SYSTEM_DIRS = {"@eaDir", "#recycle", "@tmp"}
@@ -769,11 +780,9 @@ def _should_ignore(self, name):
             or should_ignore(name, self.ignore_patterns))
 ```
 
-可在 Worktile 上直接预览的文件：
-- `sync_health.json` — 最后一轮同步结果 + 变更明细
-- `sync_progress.json` — 实时同步进度
-- `sync_state.json` — 全量文件状态记录
-- `sync_audit.csv` — 历史同步统计（可用 Excel 打开）
+查看这些监控文件的方式：
+- **HTTP 状态面板**（推荐）：浏览器访问 `http://NAS-IP:9090`（见 15.6 节）
+- **NAS File Station**：直接打开同步目录中的 JSON/CSV 文件
 
 ### 状态丢失的后果与缓解
 
@@ -1128,8 +1137,8 @@ if folder_mtime == prev_folder.remote_mtime:
     return
 ```
 
-**v4 修复**：早期版本直接 `return` 跳过整个子树，导致本地新增/修改的文件无法被检测到上传。
-修复后，远程未变化时仍会扫描本地文件系统：
+**v4 修复**：早期版本直接 `return` 跳过整个子树，导致本地新增/修改的文件永远无法被检测到上传。
+新增 `_check_local_changes()` 方法：远程 `updated_at` 未变化时，不调用 API，但仍扫描本地文件系统：
 - 新本地文件 → 创建 upload 动作
 - 已知文件本地修改 → 通过 mtime/size/hash 检测 → 创建 upload 动作
 - 新本地文件夹 → 远程创建文件夹并递归完整扫描
@@ -1219,7 +1228,7 @@ GET /drives/{id}/from-s3?version=undefined&action=download
 
 这是 Worktile 后端对 API 上传和网页上传的处理不一致导致的。**无法从客户端侧修复。**
 
-影响：监控文件（health/progress/state/audit）无法同步到 Worktile 预览。改为仅在 NAS 本地通过 File Station 查看。
+影响：监控文件（health/progress/state/audit）加入 `INTERNAL_FILES` 排除列表，不同步到 Worktile。通过 HTTP 状态面板（`http://NAS-IP:9090`）或 NAS File Station 查看。
 
 ### WebSocket 实时推送（已发现，待实现）
 
@@ -1238,11 +1247,67 @@ wss://zrhubei.worktile.com/socket.io/?token={auth_token}&...
 - 减少 API 调用量（不用定期扫描所有文件夹）
 - 更低的 CPU 和网络开销
 
+### 15.6 HTTP 状态面板 (status.py)
+
+容器内运行轻量 HTTP 服务器（基于 Python 标准库 `http.server`），提供 Web 界面和 JSON API。
+
+#### 架构
+
+```python
+# main.py 启动时
+from src.status import StatusServer
+
+status_server = StatusServer(port=config["sync"].get("status_port", 9090),
+                             local_dir=local_dir)
+status_server.start()  # 守护线程，不阻塞主循环
+```
+
+服务器在独立守护线程中运行，不影响同步主循环。
+
+#### 端点
+
+| 路径 | 方法 | 返回 | 说明 |
+|------|------|------|------|
+| `/` | GET | HTML | 自动刷新仪表盘（10 秒），展示同步状态、统计数据、最近变更列表 |
+| `/health` | GET | JSON | `sync_health.json` 原始内容 |
+| `/status` | GET | JSON | 合并 health + progress 的完整状态（适合监控系统拉取） |
+| `/progress` | GET | JSON | `sync_progress.json` 原始内容 |
+| `/audit` | GET | JSON | 最近 50 条审计 CSV 记录（解析为 JSON 数组） |
+| `/log` | GET | text | 最近 100 行运行日志 |
+
+#### 配置
+
+```yaml
+sync:
+  status_port: 9090  # 默认 9090，设为 0 禁用 HTTP 服务器
+```
+
+#### Docker 端口映射
+
+群晖 Docker GUI：Port Settings 添加 `9090:9090`
+
+docker-compose：
+
+```yaml
+ports:
+  - "9090:9090"
+```
+
+#### 设计决策
+
+- **无外部依赖**：使用 Python 标准库 `http.server`，不引入 Flask/FastAPI
+- **只读**：所有端点只读取文件，不修改任何状态
+- **守护线程**：随主进程退出，无需额外生命周期管理
+- **HTML 自动刷新**：`<meta http-equiv="refresh" content="10">` 实现，无 JavaScript 依赖
+
+---
+
 ## 16. 未来改进方向
 
 - [ ] **WebSocket 实时推送**：逆向 Socket.IO 连接，实现云端变更秒级同步
 - [ ] **Cookie 自动刷新**：通过无头浏览器自动登录
-- [ ] **Web 管理界面**：展示状态、手动触发、更新 Cookie
+- [x] **Web 状态面板**：HTTP 服务器展示同步状态、进度、日志（已实现，见 15.6）
+- [ ] **Web 管理操作**：在状态面板上支持手动触发同步、更新 Cookie
 - [ ] **并发上传**：类似下载的队列模式
 - [ ] **多团队支持**：同时同步多个 Worktile 团队
 - [ ] **选择性同步**：通过 UI 选择要同步的文件夹
@@ -1265,6 +1330,7 @@ sync:
   interval: 60
   max_workers: 3
   rate_limit: 5.0
+  status_port: 9090
   watch_local: false
   sync_delete: false
   dry_run: false

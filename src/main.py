@@ -14,6 +14,7 @@ import yaml
 from .api import WorktileAPI
 from .auth import AuthManager
 from .notify import Notifier
+from .status_server import StatusServer
 from .sync import SyncEngine
 from .utils import setup_logging
 
@@ -131,8 +132,13 @@ def main() -> None:
 
     interval = sync_cfg.get("interval", 60)
 
+    # 启动 HTTP 状态接口
+    status_port = sync_cfg.get("status_port", 9090)
+    status_server = StatusServer(local_dir, port=status_port)
+    status_server.start()
+
     # 启动通知
-    notifier.send("Worktile 同步工具已启动", f"远程: {wt['base_url']}\n本地: {sync_cfg['local_dir']}\n间隔: {interval}s")
+    notifier.send("Worktile 同步工具已启动", f"远程: {wt['base_url']}\n本地: {sync_cfg['local_dir']}\n间隔: {interval}s\n状态接口: :{status_port}")
 
     # 可选：本地文件监听
     watcher = None
@@ -249,6 +255,7 @@ def main() -> None:
     finally:
         if watcher:
             watcher.stop()
+        status_server.stop()
         api.close()
         notifier.send("Worktile 同步工具已停止", "容器已关闭")
         logger.info("同步工具已停止")
